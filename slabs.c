@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <pthread.h>
 
+#include "dmalloc.h"
 //#define DEBUG_SLAB_MOVER
 /* powers-of-N allocation structures */
 
@@ -145,7 +146,17 @@ static void * alloc_large_chunk(const size_t limit)
         ptr = NULL;
     }
 #else
-    ptr = malloc(limit);
+    // XXX: kg changed this. The variable "limit" is the amount of bytes that
+    // the user wants. We just divide this by 1GB and use dmalloc to do the
+    // allocation.
+    // YCSB works with the fixed size! This is verified with 1 GiB of memory.
+    //
+    // This is a special version of memcached, so please don't bother
+    // allocating a regular memcached malloc!
+    //
+    // Coherence should be automatic if this exist in gem5/SST. Otherwise there
+    // will be garbage data if there are multiple writers.
+    ptr = dmalloc((int)(limit / (0x40000000)) + 1, 0);
 #endif
     return ptr;
 }

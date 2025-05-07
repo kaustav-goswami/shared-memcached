@@ -1,5 +1,7 @@
 # Memcached
 
+For the disaggregated memory stuff, see README-DM.md
+
 Memcached is a high performance multithreaded event-based key/value cache
 store intended to be used in a distributed system.
 
