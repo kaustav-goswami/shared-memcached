@@ -96,56 +96,6 @@ unsigned int slabs_size(const int clsid) {
 static void * alloc_large_chunk(const size_t limit)
 {
     void *ptr = NULL;
-#if defined(__linux__) && defined(MADV_HUGEPAGE)
-    size_t pagesize = 0;
-    FILE *fp;
-    int ret;
-
-    /* Get the size of huge pages */
-    fp = fopen("/proc/meminfo", "r");
-    if (fp != NULL) {
-        char buf[64];
-
-        while ((fgets(buf, sizeof(buf), fp)))
-            if (!strncmp(buf, "Hugepagesize:", 13)) {
-                ret = sscanf(buf + 13, "%zu\n", &pagesize);
-
-                /* meminfo huge page size is in KiBs */
-                pagesize <<= 10;
-            }
-        fclose(fp);
-    }
-
-    if (!pagesize) {
-        fprintf(stderr, "Failed to get supported huge page size\n");
-        return NULL;
-    }
-
-    if (settings.verbose > 1)
-        fprintf(stderr, "huge page size: %zu\n", pagesize);
-
-    /* This works because glibc simply uses mmap when the alignment is
-     * above a certain limit. */
-    ret = posix_memalign(&ptr, pagesize, limit);
-    if (ret != 0) {
-        fprintf(stderr, "Failed to get aligned memory chunk: %d\n", ret);
-        return NULL;
-    }
-
-    ret = madvise(ptr, limit, MADV_HUGEPAGE);
-    if (ret < 0) {
-        fprintf(stderr, "Failed to set transparent hugepage hint: %d\n", ret);
-        free(ptr);
-        ptr = NULL;
-    }
-#elif defined(__FreeBSD__)
-    size_t align = (sizeof(size_t) * 8 - (__builtin_clzl(4095)));
-    ptr = mmap(NULL, limit, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON | MAP_ALIGNED(align) | MAP_ALIGNED_SUPER, -1, 0);
-    if (ptr == MAP_FAILED) {
-        fprintf(stderr, "Failed to set super pages\n");
-        ptr = NULL;
-    }
-#else
     // XXX: kg changed this. The variable "limit" is the amount of bytes that
     // the user wants. We just divide this by 1GB and use dmalloc to do the
     // allocation.
@@ -156,8 +106,7 @@ static void * alloc_large_chunk(const size_t limit)
     //
     // Coherence should be automatic if this exist in gem5/SST. Otherwise there
     // will be garbage data if there are multiple writers.
-    ptr = dmalloc((int)(limit / (0x40000000)) + 1, 0);
-#endif
+    ptr = dmalloc((limit / (0x40000000)) + 1, 0);
     return ptr;
 }
 
@@ -215,7 +164,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
 
     mem_limit = limit;
 
-    if (prealloc && mem_base_external == NULL) {
+    // kg: force memcached to allocate using the alloc_large_chunk()
+    if (true) { // prealloc && mem_base_external == NULL) {
         mem_base = alloc_large_chunk(mem_limit);
         if (mem_base) {
             do_slab_prealloc = true;
@@ -226,6 +176,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
                     " one large chunk.\nWill allocate in smaller chunks\n");
         }
     } else if (prealloc && mem_base_external != NULL) {
+        // XXX: unreachable code!
+        //
         // Can't (yet) mix hugepages with mmap allocations, so separate the
         // logic from above. Reusable memory also force-preallocates memory
         // pages into the global pool, which requires turning mem_* variables.
