@@ -5,6 +5,22 @@ Written by Kaustav Goswami. Reach out to me at kggoswami@ucdavis.edu
 This document explains how to use /dev/dax for memcached for shared
 disaggregated memories.
 
+## Building
+
+```sh
+# For memcached
+git clone https://github.com/kaustav-goswami/memcached.git
+cd memcached
+git checkout disaggregated
+./autogen.sh
+./configure
+# May fail to compile with undefined reference to shm_open
+make -j32
+# If it fails, then export LIBS=$LIBS -lrt or update the Makefile with
+# LIBS = -levent -lrt and run make again
+cd ..
+```
+
 ## User agnostic changes
 
 The changes are mostly added in `slabs.c` where the mmap call is modified to
