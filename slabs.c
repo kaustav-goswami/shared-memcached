@@ -17,6 +17,7 @@
 #include <string.h>
 #include <assert.h>
 #include <pthread.h>
+#include <assert.h>
 
 #include "dmalloc.h"
 //#define DEBUG_SLAB_MOVER
@@ -100,13 +101,13 @@ static void * alloc_large_chunk(const size_t limit)
     // the user wants. We just divide this by 1GB and use dmalloc to do the
     // allocation.
     // YCSB works with the fixed size! This is verified with 1 GiB of memory.
-    //
-    // This is a special version of memcached, so please don't bother
-    // allocating a regular memcached malloc!
-    //
-    // Coherence should be automatic if this exist in gem5/SST. Otherwise there
-    // will be garbage data if there are multiple writers.
-    ptr = dmalloc((limit / (0x40000000)) + 1, 0);
+    // 
+    // This is a special version of memcached that uses Linux shared memory to
+    // share the database and the YCSB workloads to test on a single host
+    // system.
+    // ptr = shmalloc((limit / (0x40000000)) + 1, 0);
+    // Fixing this to use the right host.
+    ptr = shmalloc(limit, settings.host_id);
     return ptr;
 }
 
@@ -161,16 +162,42 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
      * for remaining allocations. As such it makes little sense to do slab
      * preallocation. */
     bool __attribute__ ((unused)) do_slab_prealloc = false;
+    // only reset the memory if im host 0
+    if (settings.host_id == 0) {
+        printf("cleaning memory by host id %d!\n", settings.host_id);
+        munmap_memory(0x40000000 , 1, 0);
+    }
+    printf("kg: inside slabs_init :: mem limit %ld "
+        "mem base %p "
+        "\n", limit, 
+                mem_base);
 
     mem_limit = limit;
+    // prevent the user from specifying the reuse variable
+    // assert(reuse_mem == false);
+    if (settings.host_id == 0)
+        reuse_mem = false;
+    else
+        reuse_mem = true;
 
     // kg: force memcached to allocate using the alloc_large_chunk()
     if (true) { // prealloc && mem_base_external == NULL) {
         mem_base = alloc_large_chunk(mem_limit);
         if (mem_base) {
-            do_slab_prealloc = true;
-            mem_current = mem_base;
-            mem_avail = mem_limit;
+            if (settings.host_id == 0)
+                do_slab_prealloc = true;
+            else
+                do_slab_prealloc = false;
+            if (reuse_mem) {
+                mem_current = ((char*)mem_base) + mem_limit;
+                mem_avail = 0;
+            } else {
+                mem_current = mem_base;
+                mem_avail = mem_limit;
+            }
+            // mem_current = mem_base;
+
+            // mem_avail = mem_limit;
         } else {
             fprintf(stderr, "Warning: Failed to allocate requested memory in"
                     " one large chunk.\nWill allocate in smaller chunks\n");
@@ -193,15 +220,28 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             mem_avail = mem_limit;
         }
     }
-
+    // TODO: Cannot memset if this is not user 0. Other hosts should not
+    // overwrite into the memory of the database.
+    // if (settings.host_id == 0)
     memset(slabclass, 0, sizeof(slabclass));
+
+    printf("mem_base %p "
+        "slab class %p "
+        "sizeof(slabclass) %zu"
+        "max slabclasses %d "
+        "\n", mem_base, *slabclass,
+                    sizeof(slabclass),
+                    MAX_NUMBER_OF_SLAB_CLASSES);
+
 
     while (++i < MAX_NUMBER_OF_SLAB_CLASSES-1) {
         if (slab_sizes != NULL) {
+            printf("inside slab size != NULL\n");
             if (slab_sizes[i-1] == 0)
                 break;
             size = slab_sizes[i-1];
         } else if (size >= settings.slab_chunk_size_max / factor) {
+            printf("size break\n");
             break;
         }
         /* Make sure items are always n-byte aligned */
@@ -212,6 +252,8 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
         slabclass[i].perslab = settings.slab_page_size / slabclass[i].size;
         if (slab_sizes == NULL)
             size *= factor;
+        printf("slab class %p,  %3d: chunk size %9u perslab %7u\n",
+                &slabclass[i], i, slabclass[i].size, slabclass[i].perslab);
         if (settings.verbose > 1) {
             fprintf(stderr, "slab class %3d: chunk size %9u perslab %7u\n",
                     i, slabclass[i].size, slabclass[i].perslab);
@@ -243,6 +285,9 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
             slabs_preallocate(power_largest);
         }
     }
+    printf("printing memory!\n");
+    // print_memory(limit, 1, 0);
+    dump_memory(limit, 1, 0, "dump0");
 }
 
 void slabs_prefill_global(void) {
@@ -263,6 +308,8 @@ void slabs_prefill_global(void) {
 }
 
 static void slabs_preallocate(const unsigned int maxslabs) {
+    // preallocating the slab will wipe out the existing data.
+    assert(settings.host_id == 0);
     int i;
     unsigned int prealloc = 0;
 
@@ -354,11 +401,17 @@ static int do_slabs_newslab(const unsigned int id) {
     // could be unused, yet still full of data. Better for usability if we're
     // wiping memory as it's being pulled out of the global pool instead of
     // blocking startup all at once.
+    if (settings.host_id != 0)
+        printf("warn  participant host cannot memset!:\n");
+    // if this is a read, then this makes complete sense. otherwise, existing
+    // data should not be wiped
     memset(ptr, 0, (size_t)len);
     split_slab_page_into_freelist(ptr, id);
 
     p->slab_list[p->slabs++] = ptr;
     MEMCACHED_SLABS_SLABCLASS_ALLOCATE(id);
+
+    printf("slab info %d %p \n", id, ptr);
 
     return 1;
 }
@@ -366,6 +419,7 @@ static int do_slabs_newslab(const unsigned int id) {
 /*@null@*/
 static void *do_slabs_alloc(unsigned int id,
         unsigned int flags) {
+    // printf("someone called do slabs alloc id = %d\n", id);
     slabclass_t *p;
     void *ret = NULL;
     item *it = NULL;
@@ -571,6 +625,7 @@ static void *memory_allocate(size_t size) {
 
     if (mem_base == NULL) {
         /* We are not using a preallocated large memory chunk */
+        assert(false && "cannot malloc memory in this version");
         ret = malloc(size);
     } else {
         ret = mem_current;

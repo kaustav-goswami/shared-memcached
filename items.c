@@ -261,6 +261,9 @@ item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t fla
     }
 
     unsigned int id = slabs_clsid(ntotal);
+    // if (id != 13) {
+        printf("id = %d, ntotal = %zu\n", id, ntotal);
+    // }
     unsigned int hdr_id = 0;
     if (id == 0)
         return 0;

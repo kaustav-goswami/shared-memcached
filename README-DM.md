@@ -5,6 +5,17 @@ Written by Kaustav Goswami. Reach out to me at kggoswami@ucdavis.edu
 This document explains how to use /dev/dax for memcached for shared
 disaggregated memories.
 
+## Goals
+
+By making memcached disaggregated, we allocate the database once but read the database from multiple hosts.
+The actual database data is backed up by a shared memory region by host0.
+All other hosts start memcached locally, but *maps* the data structures of the database to the shared memory region.
+
+The main allocation is done once.
+Ideally, there needs to be demand paging, i.e., when the database grows, more memory is allocated as per need.
+For the security project, we only care about the allocation once.
+On a database growth, the writer will make sure to update the permission table (or something).
+
 ## Building
 
 ```sh
@@ -40,4 +51,13 @@ If you want to do the same, use Linux shared memory and get rid of the other
 functions.
 
 The data might not be updated at the remote memory due to caching.
+
+## Explanation of the code
+
+There is too much information on the code processing part.
+The real complication is due to the fact that there are other software like YCSB etc. that actually calls memcached.
+Here is a flow of each step that happens.
+
+1. Start the 
+
 

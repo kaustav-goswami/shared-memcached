@@ -53,6 +53,8 @@
 #include "queue.h"
 #include "util.h"
 
+#define EXTSTORE 1
+
 #ifdef EXTSTORE
 #include "crc32c.h"
 #endif
@@ -512,6 +514,7 @@ struct settings {
     bool watch_enabled; /* allows watch commands to be dropped */
     bool relaxed_privileges;   /* Relax process restrictions when running testapp */
     struct slab_rebal_thread *slab_rebal; /* struct for page mover thread */
+    int host_id; /* kg: host_id for disaggregation*/
 #ifdef EXTSTORE
     unsigned int ext_io_threadcount; /* number of IO threads to run. */
     unsigned int ext_page_size; /* size in megabytes of storage pages. */

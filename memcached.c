@@ -4901,6 +4901,7 @@ int main (int argc, char **argv) {
           "e:"  /* mmap path for external item memory */
           "o:"  /* Extended generic options */
           "N:"  /* NAPI ID based thread selection */
+          "x:"
           ;
 
     /* process arguments */
@@ -4942,6 +4943,10 @@ int main (int argc, char **argv) {
         {"memory-file", required_argument, 0, 'e'},
         {"extended", required_argument, 0, 'o'},
         {"napi-ids", required_argument, 0, 'N'},
+        // kg:
+        // A host id needs to be defined to distinguish between allocation and
+        // initialization.
+        {"host-id", required_argument, 0, 'x'},
         {0, 0, 0, 0}
     };
     int optindex;
@@ -4950,6 +4955,7 @@ int main (int argc, char **argv) {
 #else
     while (-1 != (c = getopt(argc, argv, shortopts))) {
 #endif
+        printf("%c %s ", c, optarg);
         if (optarg) {
             while(isspace(optarg[0])) {
                 optarg++;
@@ -5061,6 +5067,12 @@ int main (int argc, char **argv) {
             break;
         case 'e':
             settings.memory_file = optarg;
+            break;
+        // kg: added host id
+        case 'x':
+            printf("-x val :: %c\n", optarg);
+            settings.host_id = atoi(optarg);
+            printf("-settings val :: %d\n", settings.host_id);
             break;
         case 'f':
             settings.factor = atof(optarg);
@@ -5946,8 +5958,23 @@ int main (int argc, char **argv) {
         reuse_mem = false;
     }
 #endif
+    // kg:
+    // Figure out if this is called. make sure that EXTSTORE is always defined.
+    // since this memory is backed up by /dev
+    printf("kg: calling slabs_init. mem_base %p\n", mem_base);
+    printf("kg: params\t settings.maxbytes %ld, "
+         "settings.factor %f, "
+         "preallocate %d, "
+        //  "slab_sizes : %ls, "
+         "mem_base %p, "
+        "reuse_mem %d\n", settings.maxbytes, settings.factor, preallocate,
+                            // slab_sizes,
+                            mem_base, reuse_mem);
+
     slabs_init(settings.maxbytes, settings.factor, preallocate,
             use_slab_sizes ? slab_sizes : NULL, mem_base, reuse_mem);
+
+    printf("kg: calling slabs_init. mem_base %p\n", mem_base);
 #ifdef EXTSTORE
     if (storage_enabled) {
         storage = storage_init(storage_cf);

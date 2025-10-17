@@ -40,6 +40,17 @@
 // This is not bad this is dangerous
 #define nullptr NULL
 
+
+// an asm utility function on x86 to force flush the cache.
+// [[gnu::unused]] static inline __attribute__((always_inline)) 
+static inline void clflushopt(volatile void *p) {
+    // @params
+    //
+    // p: a pointer to the memory
+    asm volatile("clflushopt (%0)\n"::"r"(p)
+    : "memory");
+}
+
 // This file has three functions to mount  SHARED_MEM segment. For true
 // disaggregated memory, you need to use dmalloc(size_t,int);
 int* dmalloc(size_t, int);
@@ -127,7 +138,7 @@ int* shmalloc(size_t size, int host_id) {
     // A pointer to the mmap call
     //
     // XXX: WARNING, COHERENCE IS NOT ENFORCED when opening the file!
-    int fd = shm_open("/my_shmem2", O_CREAT | O_RDWR | O_LARGEFILE, 0666);
+    int fd = shm_open("/my_shmem21", O_CREAT | O_RDWR | O_LARGEFILE, 0666);
     if (fd == -1) {
         perror("shm_open");
         exit(EXIT_FAILURE);
@@ -142,12 +153,14 @@ int* shmalloc(size_t size, int host_id) {
     // PROT_READ/WRITE is enforced here.
     // depending upon the host id, we'll set the read/write permissons.
     if (host_id == 0) {
-        ptr = (int *) mmap(NULL, size * ONE_G,
+        ptr = (int *) mmap(NULL, size,
                                     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     }
     else {
         // This is a client host.
-        ptr = (int *) mmap(NULL, size * ONE_G, PROT_READ, MAP_SHARED, fd, 0);
+        ptr = (int *) mmap(NULL, size,
+                                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        // ptr = (int *) mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     }
     // The map may fail due to several reasons but we notify the user.
     if (ptr == MAP_FAILED) {
@@ -156,4 +169,75 @@ int* shmalloc(size_t size, int host_id) {
     }
     return ptr;
 }
+
+void flush_x86_cache(int *_mmap_pointer, size_t size) {
+    // This function forces the entire mmapped region to be flushed out of the
+    // cache.
+    //
+    // @params
+    // :_mmap_pointer_: pointer to the start of the shared mapping area.
+    // :size: size of the shared memory region in GiB
+
+    size_t *_start = (size_t *) _mmap_pointer;
+    #pragma omp parallel for
+    for (size_t i = 0 ; i < (((size * ONE_G) / sizeof(size_t))) ; i += sizeof(size_t))
+        clflushopt((_start) + i);
+}
+
+void munmap_memory(size_t size, int test_mode, int host_id) {
+    // This is a utility function to zero out the memory allocated to the graph
+    // explicitly. This has to be called by any host. Security checks aren't
+    // present if the host wants to change it's ID
+    //
+    // @params
+    // size_t size: size of the shared memory in GiB
+    // int test_mode: indicate if you're using /dev/dax or /dev/shmem
+    //
+    // @returns
+    // none
+    
+    int *start;
+    if (host_id == 0) {
+        if (test_mode)
+            start = shmalloc(size, host_id);
+        else
+            start = dmalloc(size, host_id);
+    }
+    else {
+        printf("warn: cannot munmap! Needs to be the allocator\n");
+        return;
+    }
+    // absolutely bad programming right here!
+    char *arr = (char *) &start[0];
+    #pragma omp parallel for
+    for (size_t i = 0 ; i < size ; i++)
+        arr[i] = 0; 
+}
+
+void print_memory(size_t size, int test_mode, int host_id) {
+    // for debugging only!
+    int *start = shmalloc(size, host_id);
+    char *arr = (char *) &start[0];
+
+    for (size_t i = 0 ; i < size ; i++) {
+        printf("%d ", arr[i]);
+    }
+    printf("\n");
+}
+
+void dump_memory(size_t size, int test_mode, int host_id, char* file_id) {
+    // for debugging only!
+    int *start = shmalloc(size, host_id);
+    char *arr = (char *) &start[0];
+    FILE *fp = fopen(file_id, "wb" );
+
+    // #pragma omp parallel for
+    for (size_t i = 0 ; i < size ; i++) {
+        fputc(arr[i], fp);
+    }
+    fclose(fp);
+    printf("\n");
+
+}
+
 #endif // DMALLOC_H
