@@ -1,5 +1,6 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
+#include "shm_backend.h"
 #include "bipbuffer.h"
 #include "storage.h"
 #include "slabs_mover.h"
@@ -47,18 +48,70 @@ typedef struct {
     rel_time_t evicted_time;
 } itemstats_t;
 
-static item *heads[LARGEST_ID];
-static item *tails[LARGEST_ID];
+/*
+ * LRU heads/tails, sizes, and the CAS id.  In shm mode these are pointers
+ * into the shared control block so both processes see the same state.
+ * In normal mode they point to the local static arrays below.
+ */
+static item        *_local_heads[LARGEST_ID];
+static item        *_local_tails[LARGEST_ID];
+static unsigned int _local_sizes[LARGEST_ID];
+static uint64_t     _local_sizes_bytes[LARGEST_ID];
+static uint64_t     _local_cas_id = 1;
+
+static item       **g_heads           = _local_heads;
+static item       **g_tails           = _local_tails;
+static unsigned int *g_sizes          = _local_sizes;
+static uint64_t    *g_sizes_bytes     = _local_sizes_bytes;
+static uint64_t    *g_cas_id_p        = &_local_cas_id;
+
+/* Transparent redirecting macros – the rest of the file is unchanged */
+#define heads        g_heads
+#define tails        g_tails
+#define sizes        g_sizes
+#define sizes_bytes  g_sizes_bytes
+#define cas_id       (*g_cas_id_p)
+
 static itemstats_t itemstats[LARGEST_ID];
-static unsigned int sizes[LARGEST_ID];
-static uint64_t sizes_bytes[LARGEST_ID];
 static unsigned int *stats_sizes_hist = NULL;
 static int stats_sizes_buckets = 0;
-static uint64_t cas_id = 1;
 
 static volatile int do_run_lru_maintainer_thread = 0;
 static pthread_mutex_t lru_maintainer_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t _local_cas_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t *cas_id_lock_p     = &_local_cas_id_lock;
+/* Redirect all cas_id_lock usages */
+#define cas_id_lock (*cas_id_lock_p)
+
+/*
+ * items_shm_setup – redirect LRU and CAS state to the shared control block.
+ * Called from memcached.c after shm_backend_create() / shm_backend_attach().
+ */
+void items_shm_setup(mc_shm_backend_t *b)
+{
+    shm_control_block_t *ctrl = b->ctrl;
+    g_heads       = (item **)ctrl->lru_heads;
+    g_tails       = (item **)ctrl->lru_tails;
+    g_sizes       = ctrl->lru_sizes;
+    g_sizes_bytes = ctrl->lru_sizes_bytes;
+
+    /*
+     * Suspend the cas_id and cas_id_lock macros (defined above as
+     * (*g_cas_id_p) and (*cas_id_lock_p)) so the ctrl->field accesses
+     * below are not mangled by the preprocessor.
+     */
+#pragma push_macro("cas_id")
+#pragma push_macro("cas_id_lock")
+#undef cas_id
+#undef cas_id_lock
+
+    g_cas_id_p    = &ctrl->cas_id;
+    cas_id_lock_p = &ctrl->cas_id_lock;
+
+#pragma pop_macro("cas_id_lock")
+#pragma pop_macro("cas_id")
+}
 
 void item_stats_reset(void) {
     int i;

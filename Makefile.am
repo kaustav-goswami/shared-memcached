@@ -13,7 +13,7 @@ memcached_SOURCES = memcached.c memcached.h \
                     jenkins_hash.c jenkins_hash.h \
                     murmur3_hash.c murmur3_hash.h \
                     queue.h \
-                    slabs.c slabs.h \
+                    slabs.c slabs.h slabs_types.h \
                     items.c items.h \
                     assoc.c assoc.h \
                     thread.c daemon.c \
@@ -30,7 +30,12 @@ memcached_SOURCES = memcached.c memcached.h \
                     authfile.c authfile.h \
                     restart.c restart.h \
                     proto_text.c proto_text.h \
-                    proto_bin.c proto_bin.h
+                    proto_bin.c proto_bin.h \
+                    shm_backend.c shm_backend.h \
+                    allocator/src/shm_alloc.c \
+                    allocator/src/shm_ns.c \
+                    allocator/src/shm_ns.h \
+                    allocator/include/shm_alloc.h
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
@@ -87,11 +92,13 @@ endif
 
 memcached_debug_SOURCES = $(memcached_SOURCES)
 memcached_CPPFLAGS = -DNDEBUG
-memcached_debug_LDADD = @PROFILER_LDFLAGS@
+memcached_debug_LDADD = @PROFILER_LDFLAGS@ -lrt -lpthread
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
+memcached_debug_CPPFLAGS = -I$(srcdir)/allocator/include
 
-memcached_LDADD =
+memcached_LDADD = -lrt -lpthread
 memcached_LDFLAGS =
+memcached_CPPFLAGS += -I$(srcdir)/allocator/include
 memcached_debug_LDFLAGS =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =

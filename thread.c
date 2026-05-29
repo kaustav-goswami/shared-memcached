@@ -3,6 +3,7 @@
  * Thread management for memcached.
  */
 #include "memcached.h"
+#include "shm_backend.h"
 #ifdef EXTSTORE
 #include "storage.h"
 #endif
@@ -62,8 +63,12 @@ struct conn_queue {
     cache_t *cache; /* freelisted objects */
 };
 
-/* Locks for cache LRU operations */
-pthread_mutex_t lru_locks[POWER_LARGEST];
+/* Locks for cache LRU operations.
+ * In shm mode these point into the shared control block so that both
+ * processes protect the same LRU lists with the same process-shared mutexes.
+ * In normal mode they are a locally-allocated array. */
+static pthread_mutex_t _local_lru_locks[POWER_LARGEST];
+pthread_mutex_t *lru_locks = _local_lru_locks;
 
 /* Connection lock around accepting new connections */
 pthread_mutex_t conn_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1083,6 +1088,27 @@ void memcached_thread_init(int nthreads, void *arg) {
     int         i;
     int         power;
 
+    if (g_shm_backend) {
+        /*
+         * Shared-memory mode: use the process-shared locks from the control
+         * block.  The creator already initialised them with
+         * PTHREAD_PROCESS_SHARED in shm_backend_create(); attaching processes
+         * just point at the same memory.
+         */
+        shm_control_block_t *ctrl = g_shm_backend->ctrl;
+
+        lru_locks           = ctrl->lru_locks;
+        item_locks          = ctrl->item_locks;
+        item_lock_count     = ctrl->item_lock_count;
+        item_lock_hashpower = ctrl->item_lock_hashpower;
+
+        pthread_mutex_init(&worker_hang_lock, NULL);
+        pthread_mutex_init(&init_lock, NULL);
+        pthread_cond_init(&init_cond, NULL);
+
+        goto spawn_threads;
+    }
+
     for (i = 0; i < POWER_LARGEST; i++) {
         pthread_mutex_init(&lru_locks[i], NULL);
     }
@@ -1125,6 +1151,8 @@ void memcached_thread_init(int nthreads, void *arg) {
     for (i = 0; i < item_lock_count; i++) {
         pthread_mutex_init(&item_locks[i], NULL);
     }
+
+spawn_threads:
 
     threads = calloc(nthreads, sizeof(LIBEVENT_THREAD));
     if (! threads) {

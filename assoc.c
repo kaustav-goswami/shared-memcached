@@ -12,6 +12,7 @@
  */
 
 #include "memcached.h"
+#include "shm_backend.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -53,6 +54,23 @@ static bool expanding = false;
 static uint64_t expand_bucket = 0;
 
 void assoc_init(const int hashtable_init) {
+    if (g_shm_backend) {
+        /*
+         * Shared-memory mode: the hash table lives in the shm region.
+         * The creator has already allocated and zeroed it in shm_backend_create().
+         * The attaching process simply points primary_hashtable at the same shm
+         * allocation (same VA in both processes).
+         */
+        hashpower         = g_shm_backend->ctrl->hashpower;
+        primary_hashtable = (item **)g_shm_backend->ctrl->primary_hashtable;
+
+        STATS_LOCK();
+        stats_state.hash_power_level = hashpower;
+        stats_state.hash_bytes       = hashsize(hashpower) * sizeof(void *);
+        STATS_UNLOCK();
+        return;
+    }
+
     if (hashtable_init) {
         hashpower = hashtable_init;
     }
@@ -120,6 +138,10 @@ static item** _hashitem_before (const char *key, const size_t nkey, const uint32
 
 /* grows the hashtable to the next power of 2. */
 static void assoc_expand(void) {
+    if (g_shm_backend) {
+        /* Hash table is a fixed-size shm allocation; expansion not supported. */
+        return;
+    }
     old_hashtable = primary_hashtable;
 
     primary_hashtable = calloc(hashsize(hashpower + 1), sizeof(void *));

@@ -2,6 +2,8 @@
 #ifndef SLABS_H
 #define SLABS_H
 
+#include "slabs_types.h"  /* slabclass_t */
+
 /** Init the subsystem. 1st argument is the limit on no. of bytes to allocate,
     0 if no limit. 2nd argument is the growth factor; each slab will use a chunk
     size equal to the previous slab's chunk size times this factor.
@@ -62,5 +64,10 @@ int slabs_grow_slab_list(const unsigned int id);
 
 /* Fixup for restartable code. */
 unsigned int slabs_fixup(char *chunk, const int border);
+
+/* Shared-memory integration */
+struct mc_shm_backend;
+void slabs_shm_setup(struct mc_shm_backend *b, bool is_creator);
+void slabs_shm_restore_state(struct mc_shm_backend *b);
 
 #endif

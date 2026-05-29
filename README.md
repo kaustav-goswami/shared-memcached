@@ -15,6 +15,18 @@ https://memcached.org/timeouts
 https://memcached.org/ is a good resource in general. Please use the mailing
 list to ask questions, github issues aren't seen by everyone!
 
+Parts of the repository is vibe-coded.
+
+## Shared-memory backend (benchmark / disaggregated memory)
+
+This tree adds an optional POSIX shared-memory backend so two memcached
+processes can share the same slab arena, hash table, and LRU state. Typical
+use: **port 11211** loads data (`-o shm_create`); **port 11212** runs YCSB
+workloads (`-o shm_attach`) against the same keys.
+
+Full design, every `shm_alloc` API call, file-by-file walkthrough, and CLI
+reference: **[doc/SHM_BACKEND.md](doc/SHM_BACKEND.md)**.
+
 ## Dependencies
 
 * libevent - https://www.monkey.org/~provos/libevent/ (libevent-dev)

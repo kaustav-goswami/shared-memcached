@@ -10,6 +10,12 @@
 uint64_t get_cas_id(void);
 void set_cas_id(uint64_t new_cas);
 
+/* Shared-memory integration */
+struct mc_shm_backend;
+void items_shm_setup(struct mc_shm_backend *b);
+
+extern pthread_mutex_t *lru_locks;
+
 /*@null@*/
 item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t flags, const rel_time_t exptime, const int nbytes);
 item_chunk *do_item_alloc_chunk(item_chunk *ch, const size_t bytes_remain);
@@ -74,7 +80,6 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, LIBEVEN
 item *do_item_touch(const char *key, const size_t nkey, uint32_t exptime, const uint32_t hv, LIBEVENT_THREAD *t);
 void do_item_bump(LIBEVENT_THREAD *t, item *it, const uint32_t hv);
 void item_stats_reset(void);
-extern pthread_mutex_t lru_locks[POWER_LARGEST];
 
 int start_lru_maintainer_thread(void *arg);
 int stop_lru_maintainer_thread(void);

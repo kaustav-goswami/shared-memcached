@@ -18,6 +18,7 @@
 #include "authfile.h"
 #include "restart.h"
 #include "slabs_mover.h"
+#include "shm_backend.h"
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -107,6 +108,9 @@ struct stats_state stats_state;
 struct settings settings;
 time_t process_started;     /* when the process was started */
 conn **conns;
+
+/* Global shared-memory backend handle.  NULL unless --shm-name is passed. */
+struct mc_shm_backend *g_shm_backend = NULL;
 
 #ifdef EXTSTORE
 /* hoping this is temporary; I'd prefer to cut globals, but will complete this
@@ -275,6 +279,9 @@ static void settings_init(void) {
 #endif
     settings.num_napi_ids = 0;
     settings.memory_file = NULL;
+    settings.shm_name    = NULL;  /* set via -o shm_name=/name to enable SHM backend */
+    settings.shm_size    = 0;     /* 0 = use -m maxbytes for slab arena size */
+    settings.shm_create  = true;  /* default role when SHM enabled: creator (port 11211) */
 #ifdef SOCK_COOKIE_ID
     settings.sock_cookie_id = 0;
 #endif
@@ -4771,6 +4778,10 @@ int main (int argc, char **argv) {
 #ifdef SOCK_COOKIE_ID
         COOKIE_ID,
 #endif
+        SHM_NAME,
+        SHM_SIZE,
+        SHM_CREATE,
+        SHM_ATTACH,
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -4835,6 +4846,10 @@ int main (int argc, char **argv) {
 #ifdef SOCK_COOKIE_ID
         [COOKIE_ID] = "sock_cookie_id",
 #endif
+        [SHM_NAME]   = "shm_name",
+        [SHM_SIZE]   = "shm_size",
+        [SHM_CREATE] = "shm_create",
+        [SHM_ATTACH] = "shm_attach",
         NULL
     };
 
@@ -5592,6 +5607,28 @@ int main (int argc, char **argv) {
                 (void)safe_strtoul(subopts_value, &settings.sock_cookie_id);
                 break;
 #endif
+            case SHM_NAME:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "shm_name requires a value (e.g. /memcached_shm)\n");
+                    goto error;
+                }
+                settings.shm_name = strdup(subopts_value);
+                break;
+            case SHM_SIZE: {
+                uint64_t shm_mb = 0;
+                if (subopts_value == NULL || !safe_strtoull(subopts_value, &shm_mb)) {
+                    fprintf(stderr, "shm_size requires a numeric MB value\n");
+                    goto error;
+                }
+                settings.shm_size = (size_t)shm_mb * 1024 * 1024;
+                break;
+            }
+            case SHM_CREATE:
+                settings.shm_create = true;
+                break;
+            case SHM_ATTACH:
+                settings.shm_create = false;  /* explicit attach */
+                break;
             default:
 #ifdef EXTSTORE
                 // TODO: differentiating response code.
@@ -5935,6 +5972,54 @@ int main (int argc, char **argv) {
         // Also, the callbacks for load() run before _open returns, so we
         // should have the old base in 'meta' as of here.
     }
+    /* ── Shared-memory backend initialisation ─────────────────────────────
+     * Must happen before assoc_init() and slabs_init() so that those
+     * subsystems can redirect their state into the shared control block.
+     */
+    if (settings.shm_name) {
+        /* Default shm_size to maxbytes if not explicitly set */
+        if (settings.shm_size == 0)
+            settings.shm_size = settings.maxbytes;
+
+        /* Default hashtable_power: derived from hashpower_init setting */
+        uint32_t ht_power = settings.hashpower_init
+                                ? (uint32_t)settings.hashpower_init
+                                : HASHPOWER_DEFAULT;
+
+        if (settings.shm_create) {
+            int rc = shm_backend_create(settings.shm_name,
+                                        settings.shm_size,
+                                        ht_power,
+                                        (mc_shm_backend_t **)&g_shm_backend);
+            if (rc != 0) {
+                fprintf(stderr, "shm_backend_create(%s) failed: %s\n",
+                        settings.shm_name, strerror(rc));
+                exit(EXIT_FAILURE);
+            }
+            fprintf(stderr, "shm: created region '%s' (%zu MB slab arena, "
+                    "hashpower=%u)\n",
+                    settings.shm_name,
+                    settings.shm_size / (1024 * 1024),
+                    ht_power);
+        } else {
+            int rc = shm_backend_attach(settings.shm_name,
+                                        (mc_shm_backend_t **)&g_shm_backend);
+            if (rc != 0) {
+                fprintf(stderr, "shm_backend_attach(%s) failed: %s\n",
+                        settings.shm_name, strerror(rc));
+                exit(EXIT_FAILURE);
+            }
+            fprintf(stderr, "shm: attached to region '%s'\n",
+                    settings.shm_name);
+        }
+
+        /* Redirect slab subsystem state */
+        slabs_shm_setup((mc_shm_backend_t *)g_shm_backend,
+                        settings.shm_create);
+        /* Redirect items subsystem state */
+        items_shm_setup((mc_shm_backend_t *)g_shm_backend);
+    }
+
     // Initialize the hash table _after_ checking restart metadata.
     // We override the hash table start argument with what was live
     // previously, to avoid filling a huge set of items into a tiny hash
@@ -5946,8 +6031,27 @@ int main (int argc, char **argv) {
         reuse_mem = false;
     }
 #endif
-    slabs_init(settings.maxbytes, settings.factor, preallocate,
-            use_slab_sizes ? slab_sizes : NULL, mem_base, reuse_mem);
+    if (g_shm_backend && !settings.shm_create) {
+        /* Attaching process: arena is already populated by the creator.
+         * Call slabs_init() with reuse_mem=true to skip preallocating pages. */
+        size_t slab_limit = ((mc_shm_backend_t *)g_shm_backend)->slab_size;
+        slabs_init(slab_limit, settings.factor, preallocate,
+                use_slab_sizes ? slab_sizes : NULL,
+                ((mc_shm_backend_t *)g_shm_backend)->slab_arena,
+                /*reuse_mem=*/true);
+        slabs_shm_restore_state((mc_shm_backend_t *)g_shm_backend);
+    } else if (g_shm_backend && settings.shm_create) {
+        /* Creating process: initialise slabs with the shm slab arena. */
+        size_t slab_limit = ((mc_shm_backend_t *)g_shm_backend)->slab_size;
+        preallocate = true;
+        slabs_init(slab_limit, settings.factor, preallocate,
+                use_slab_sizes ? slab_sizes : NULL,
+                ((mc_shm_backend_t *)g_shm_backend)->slab_arena,
+                /*reuse_mem=*/false);
+    } else {
+        slabs_init(settings.maxbytes, settings.factor, preallocate,
+                use_slab_sizes ? slab_sizes : NULL, mem_base, reuse_mem);
+    }
 #ifdef EXTSTORE
     if (storage_enabled) {
         storage = storage_init(storage_cf);
@@ -6040,6 +6144,12 @@ int main (int argc, char **argv) {
         if (!settings.slab_rebal) {
             exit(EXIT_FAILURE);
         }
+    }
+
+    /* Signal attaching processes that full initialisation is complete */
+    if (g_shm_backend && settings.shm_create) {
+        ((mc_shm_backend_t *)g_shm_backend)->ctrl->initialized = 1;
+        fprintf(stderr, "shm: signalled ready (ctrl->initialized=1)\n");
     }
 
     if (settings.idle_timeout && start_conn_timeout_thread() == -1) {

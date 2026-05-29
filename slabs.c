@@ -6,6 +6,7 @@
  * a multiplier factor from there, up to half the maximum slab size.
  */
 #include "memcached.h"
+#include "shm_backend.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -19,36 +20,48 @@
 #include <pthread.h>
 
 //#define DEBUG_SLAB_MOVER
-/* powers-of-N allocation structures */
 
-typedef struct {
-    uint32_t size;      /* sizes of items */
-    uint32_t perslab;   /* how many items per slab */
-
-    void *slots;           /* list of item ptrs */
-    unsigned int sl_curr;   /* total free items in list */
-
-    unsigned int slabs;     /* how many slabs were allocated for this class */
-
-    void **slab_list;       /* array of slab pointers */
-    unsigned int list_size; /* size of prev array */
-} slabclass_t;
-
-static slabclass_t slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
-static size_t mem_limit = 0;
-static size_t mem_malloced = 0;
-/* If the memory limit has been hit once. Used as a hint to decide when to
- * early-wake the LRU maintenance thread */
-static bool mem_limit_reached = false;
-static int power_largest;
-
-static void *mem_base = NULL;
-static void *mem_current = NULL;
-static size_t mem_avail = 0;
-/**
- * Access to the slab allocator is protected by this lock
+/*
+ * slabclass_t is now defined in slabs_types.h (included via shm_backend.h).
+ * In shm mode the array lives in the shared control block; in normal mode
+ * it lives here as a local static.
  */
-static pthread_mutex_t slabs_lock = PTHREAD_MUTEX_INITIALIZER;
+static slabclass_t _local_slabclass[MAX_NUMBER_OF_SLAB_CLASSES];
+static slabclass_t *slabclass = _local_slabclass;
+
+/*
+ * Per-process mutable slab state.  In shm mode these variables are redirected
+ * to the control block so that both processes see the same values.
+ * We use pointer indirection + macros so the rest of the file is unchanged.
+ */
+static size_t _local_mem_limit       = 0;
+static size_t _local_mem_malloced    = 0;
+static bool   _local_mem_limit_reached = false;
+static int    _local_power_largest   = 0;
+static void  *_local_mem_base        = NULL;
+static void  *_local_mem_current     = NULL;
+static size_t _local_mem_avail       = 0;
+
+static size_t *_mem_limit_p          = &_local_mem_limit;
+static size_t *_mem_malloced_p       = &_local_mem_malloced;
+static bool   *_mem_limit_reached_p  = &_local_mem_limit_reached;
+static int    *_power_largest_p      = &_local_power_largest;
+static void  **_mem_base_p           = &_local_mem_base;
+static void  **_mem_current_p        = &_local_mem_current;
+static size_t *_mem_avail_p          = &_local_mem_avail;
+
+#define mem_limit         (*_mem_limit_p)
+#define mem_malloced      (*_mem_malloced_p)
+#define mem_limit_reached (*_mem_limit_reached_p)
+#define power_largest     (*_power_largest_p)
+#define mem_base          (*_mem_base_p)
+#define mem_current       (*_mem_current_p)
+#define mem_avail         (*_mem_avail_p)
+
+/* The slab allocator lock.  In shm mode this points to the process-shared
+ * mutex in the control block; otherwise it points to a local initialised mutex. */
+static pthread_mutex_t _local_slabs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t *slabs_lock_p     = &_local_slabs_lock;
 
 /*
  * Forward Declarations
@@ -231,7 +244,22 @@ void slabs_init(const size_t limit, const double factor, const bool prealloc, co
         }
     }
 
-    memset(slabclass, 0, sizeof(slabclass));
+    memset(slabclass, 0, sizeof(*slabclass) * MAX_NUMBER_OF_SLAB_CLASSES);
+
+    /*
+     * In SHM mode init_ctrl() / slabs_shm_setup() already wired each
+     * slabclass[i].slab_list to ctrl->sc_slab_list[i] with list_size
+     * SLABS_SHM_MAX_LIST.  The memset above clears those pointers; restore them
+     * before any slab allocation runs.
+     */
+    if (g_shm_backend) {
+        shm_control_block_t *ctrl =
+            ((struct mc_shm_backend *)g_shm_backend)->ctrl;
+        for (int j = 0; j < MAX_NUMBER_OF_SLAB_CLASSES; j++) {
+            slabclass[j].slab_list = ctrl->sc_slab_list[j];
+            slabclass[j].list_size = SLABS_SHM_MAX_LIST;
+        }
+    }
 
     while (++i < MAX_NUMBER_OF_SLAB_CLASSES-1) {
         if (slab_sizes != NULL) {
@@ -326,8 +354,14 @@ static int do_grow_slab_list(const unsigned int id) {
         return 0;
 
     slabclass_t *p = &slabclass[id];
-    if (p->slabs == p->list_size) {
-        size_t new_size =  (p->list_size != 0) ? p->list_size * 2 : 16;
+    if (p->list_size > 0 && p->slabs >= p->list_size) {
+        if (g_shm_backend) {
+            /* slab_list is pre-allocated in the control block; cannot grow */
+            fprintf(stderr, "slabs: slab_list full for class %u (limit %u)\n",
+                    id, p->list_size);
+            return 0;
+        }
+        size_t new_size = (p->list_size != 0) ? p->list_size * 2 : 16;
         void *new_list = realloc(p->slab_list, new_size * sizeof(void *));
         if (new_list == 0) return 0;
         p->list_size = new_size;
@@ -338,9 +372,9 @@ static int do_grow_slab_list(const unsigned int id) {
 
 int slabs_grow_slab_list(const unsigned int id) {
     int ret = 0;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     ret = do_grow_slab_list(id);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
@@ -523,7 +557,7 @@ static void do_slabs_free(void *ptr, unsigned int id) {
  */
 void fill_slab_stats_automove(slab_stats_automove *am) {
     int n;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
         slabclass_t *p = &slabclass[n];
         slab_stats_automove *cur = &am[n];
@@ -532,7 +566,7 @@ void fill_slab_stats_automove(slab_stats_automove *am) {
         cur->total_pages = p->slabs;
         cur->chunk_size = p->size;
     }
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 }
 
 /* TODO: slabs_available_chunks should grow up to encompass this.
@@ -540,11 +574,11 @@ void fill_slab_stats_automove(slab_stats_automove *am) {
  */
 unsigned int global_page_pool_size(bool *mem_flag) {
     unsigned int ret = 0;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     if (mem_flag != NULL)
         *mem_flag = mem_malloced >= mem_limit ? true : false;
     ret = slabclass[SLAB_GLOBAL_PAGE_POOL].slabs;
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
@@ -652,22 +686,22 @@ static void memory_release(void) {
 void *slabs_alloc(unsigned int id, unsigned int flags) {
     void *ret;
 
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     ret = do_slabs_alloc(id, flags);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
 void slabs_free(void *ptr, unsigned int id) {
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     do_slabs_free(ptr, id);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 }
 
 void slabs_stats(ADD_STAT add_stats, void *c) {
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     do_slabs_stats(add_stats, c);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 }
 
 static bool do_slabs_adjust_mem_limit(size_t new_mem_limit) {
@@ -683,9 +717,9 @@ static bool do_slabs_adjust_mem_limit(size_t new_mem_limit) {
 
 bool slabs_adjust_mem_limit(size_t new_mem_limit) {
     bool ret;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     ret = do_slabs_adjust_mem_limit(new_mem_limit);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
@@ -694,14 +728,14 @@ unsigned int slabs_available_chunks(const unsigned int id, bool *mem_flag,
     unsigned int ret;
     slabclass_t *p;
 
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     p = &slabclass[id];
     ret = p->sl_curr;
     if (mem_flag != NULL)
         *mem_flag = mem_malloced >= mem_limit ? true : false;
     if (chunks_perslab != NULL)
         *chunks_perslab = p->perslab;
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
@@ -711,10 +745,10 @@ void *slabs_peek_page(const unsigned int id, uint32_t *size, uint32_t *perslab) 
     if (id > power_largest) {
         return NULL;
     }
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     s_cls = &slabclass[id];
     if (s_cls->slabs < 2) {
-        pthread_mutex_unlock(&slabs_lock);
+        pthread_mutex_unlock(slabs_lock_p);
         return NULL;
     }
     *size = s_cls->size;
@@ -722,7 +756,7 @@ void *slabs_peek_page(const unsigned int id, uint32_t *size, uint32_t *perslab) 
 
     page = s_cls->slab_list[0];
 
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 
     return page;
 }
@@ -744,7 +778,7 @@ void do_slabs_unlink_free_chunk(const unsigned int id, item *it) {
 }
 
 void slabs_finalize_page_move(const unsigned int sid, const unsigned int did, void *page) {
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     slabclass_t *s_cls = &slabclass[sid];
     slabclass_t *d_cls = &slabclass[did];
 
@@ -772,14 +806,14 @@ void slabs_finalize_page_move(const unsigned int sid, const unsigned int did, vo
         memory_release();
     }
 
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 }
 /* Iterate at most once through the slab classes and pick a "random" source.
  * I like this better than calling rand() since rand() is slow enough that we
  * can just check all of the classes once instead.
  */
 int slabs_pick_any_for_reassign(const unsigned int did) {
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     static int cur = POWER_SMALLEST - 1;
     int tries = MAX_NUMBER_OF_SLAB_CLASSES - POWER_SMALLEST + 1;
     for (; tries > 0; tries--) {
@@ -789,27 +823,27 @@ int slabs_pick_any_for_reassign(const unsigned int did) {
         if (cur == did)
             continue;
         if (slabclass[cur].slabs > 1) {
-            pthread_mutex_unlock(&slabs_lock);
+            pthread_mutex_unlock(slabs_lock_p);
             return cur;
         }
     }
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return -1;
 }
 
 int slabs_page_count(const unsigned int id) {
     int ret;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     ret = slabclass[id].slabs;
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
     return ret;
 }
 
 int slabs_locked_callback(slabs_cb cb, void *arg) {
     int ret = 0;
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
     ret = cb(arg);
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 
     return ret;
 }
@@ -821,9 +855,74 @@ int slabs_locked_callback(slabs_cb cb, void *arg) {
  * into callbacks when an interface becomes more obvious.
  */
 void slabs_mlock(void) {
-    pthread_mutex_lock(&slabs_lock);
+    pthread_mutex_lock(slabs_lock_p);
 }
 
 void slabs_munlock(void) {
-    pthread_mutex_unlock(&slabs_lock);
+    pthread_mutex_unlock(slabs_lock_p);
 }
+
+/*
+ * slabs_shm_setup – redirect slab state to the shared control block.
+ *
+ * Called from memcached.c after shm_backend_create() / shm_backend_attach()
+ * and before slabs_init().  In the attach path the arena bump-pointer is
+ * already committed by the creator; slabs_init() is called with reuse_mem=true
+ * so it skips preallocating pages.
+ */
+void slabs_shm_setup(mc_shm_backend_t *b, bool is_creator)
+{
+    shm_control_block_t *ctrl = b->ctrl;
+
+    slabclass = ctrl->slabclass;
+
+    /* Re-wire slab_list pointers for the attaching process */
+    for (int i = 0; i < MAX_NUMBER_OF_SLAB_CLASSES; i++) {
+        slabclass[i].slab_list = ctrl->sc_slab_list[i];
+        slabclass[i].list_size = SLABS_SHM_MAX_LIST;
+    }
+
+    slabs_lock_p = &ctrl->slabs_lock;
+
+    /*
+     * The macros mem_limit, mem_malloced, etc. are defined earlier in this
+     * file as (*_..._p).  Temporarily suspend them so that ctrl->field
+     * accesses below are not mangled by the preprocessor.
+     */
+#pragma push_macro("mem_limit")
+#pragma push_macro("mem_malloced")
+#pragma push_macro("mem_limit_reached")
+#pragma push_macro("power_largest")
+#pragma push_macro("mem_base")
+#pragma push_macro("mem_current")
+#pragma push_macro("mem_avail")
+#undef mem_limit
+#undef mem_malloced
+#undef mem_limit_reached
+#undef power_largest
+#undef mem_base
+#undef mem_current
+#undef mem_avail
+
+    _mem_limit_p         = &ctrl->mem_limit;
+    _mem_malloced_p      = &ctrl->mem_malloced;
+    _mem_limit_reached_p = (bool *)&ctrl->mem_limit_reached;
+    _power_largest_p     = &ctrl->power_largest;
+    _mem_base_p          = &ctrl->mem_base;
+    _mem_current_p       = &ctrl->mem_current;
+    _mem_avail_p         = &ctrl->mem_avail;
+
+#pragma pop_macro("mem_avail")
+#pragma pop_macro("mem_current")
+#pragma pop_macro("mem_base")
+#pragma pop_macro("power_largest")
+#pragma pop_macro("mem_limit_reached")
+#pragma pop_macro("mem_malloced")
+#pragma pop_macro("mem_limit")
+
+    (void)is_creator;
+}
+
+/* Called after slabs_init() in the attach path – arena state is already live
+ * in the control block, so this is a no-op placeholder. */
+void slabs_shm_restore_state(mc_shm_backend_t *b) { (void)b; }

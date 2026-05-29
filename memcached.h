@@ -9,6 +9,12 @@
 #include "config.h"
 #endif
 
+/* Forward-declare mc_shm_backend_t so memcached.h can expose g_shm_backend
+ * without pulling in all of shm_backend.h (which in turn includes slabs_types.h
+ * etc.).  Files that actually use the backend include shm_backend.h explicitly. */
+struct mc_shm_backend;
+extern struct mc_shm_backend *g_shm_backend;
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -544,6 +550,10 @@ struct settings {
 #endif
     int num_napi_ids;   /* maximum number of NAPI IDs */
     char *memory_file;  /* warm restart memory file path */
+    /* Shared-memory backend options */
+    char *shm_name;     /* POSIX shm name, e.g. "/memcached_shm" (NULL = disabled) */
+    size_t shm_size;    /* total shm slab arena size in bytes (default = maxbytes) */
+    bool shm_create;    /* true = create new region (process 1) */
 #ifdef PROXY
     bool proxy_enabled;
     bool proxy_uring; /* if the proxy should use io_uring */
