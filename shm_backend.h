@@ -118,26 +118,31 @@ typedef struct mc_shm_backend {
 /**
  * Create a fresh shared-memory region and initialise all shared state.
  *
- * @param name            POSIX shm name, e.g. "/memcached_shm".
+ * @param name            POSIX shm name (e.g. "/memcached_shm") or DAX device
+ *                        path (e.g. "/dev/dax0.0").
  * @param slab_size       Bytes to reserve for the slab arena.
  * @param hashtable_power Hash-table size = 1 << hashtable_power.
+ * @param backend         SHM_BACKEND_POSIX or SHM_BACKEND_DAX.
  * @param out             Receives the backend handle on success.
  * @return 0 on success; errno-compatible code on failure.
  */
 int shm_backend_create(const char       *name,
                        size_t            slab_size,
                        uint32_t          hashtable_power,
+                       shm_backend_t     backend,
                        mc_shm_backend_t **out);
 
 /**
  * Attach to an existing shared-memory region created by another process.
  * Blocks until the creator sets ctrl->initialized = 1.
  *
- * @param name  POSIX shm name used by the creator.
- * @param out   Receives the backend handle on success.
+ * @param name    POSIX shm name or DAX device path used by the creator.
+ * @param backend SHM_BACKEND_POSIX or SHM_BACKEND_DAX (must match creator).
+ * @param out     Receives the backend handle on success.
  * @return 0 on success; errno-compatible code on failure.
  */
 int shm_backend_attach(const char       *name,
+                       shm_backend_t     backend,
                        mc_shm_backend_t **out);
 
 /**

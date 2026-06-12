@@ -19,10 +19,12 @@ Parts of the repository is vibe-coded.
 
 ## Shared-memory backend (benchmark / disaggregated memory)
 
-This tree adds an optional POSIX shared-memory backend so two memcached
-processes can share the same slab arena, hash table, and LRU state. Typical
-use: **port 11211** loads data (`-o shm_create`); **port 11212** runs YCSB
-workloads (`-o shm_attach`) against the same keys.
+This tree adds an optional shared-memory backend so two memcached
+processes can share the same slab arena, hash table, and LRU state. Backends:
+**POSIX** (`-o shm_backend=posix`, default) or **DAX / CXL** (`-o shm_backend=dax`,
+`-o shm_name=/dev/dax0.0`). Typical use: **port 11211** loads data
+(`-o shm_create`); **port 11212** runs YCSB workloads (`-o shm_attach`) against
+the same keys.
 
 Full design, every `shm_alloc` API call, file-by-file walkthrough, and CLI
 reference: **[doc/SHM_BACKEND.md](doc/SHM_BACKEND.md)**.

@@ -282,6 +282,7 @@ static void settings_init(void) {
     settings.shm_name    = NULL;  /* set via -o shm_name=/name to enable SHM backend */
     settings.shm_size    = 0;     /* 0 = use -m maxbytes for slab arena size */
     settings.shm_create  = true;  /* default role when SHM enabled: creator (port 11211) */
+    settings.shm_backend = SHM_BACKEND_POSIX;
 #ifdef SOCK_COOKIE_ID
     settings.sock_cookie_id = 0;
 #endif
@@ -4782,6 +4783,7 @@ int main (int argc, char **argv) {
         SHM_SIZE,
         SHM_CREATE,
         SHM_ATTACH,
+        SHM_BACKEND,
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -4850,6 +4852,7 @@ int main (int argc, char **argv) {
         [SHM_SIZE]   = "shm_size",
         [SHM_CREATE] = "shm_create",
         [SHM_ATTACH] = "shm_attach",
+        [SHM_BACKEND] = "shm_backend",
         NULL
     };
 
@@ -5629,6 +5632,21 @@ int main (int argc, char **argv) {
             case SHM_ATTACH:
                 settings.shm_create = false;  /* explicit attach */
                 break;
+            case SHM_BACKEND:
+                if (subopts_value == NULL) {
+                    fprintf(stderr, "shm_backend requires posix or dax\n");
+                    goto error;
+                }
+                if (strcmp(subopts_value, "dax") == 0) {
+                    settings.shm_backend = SHM_BACKEND_DAX;
+                } else if (strcmp(subopts_value, "posix") == 0) {
+                    settings.shm_backend = SHM_BACKEND_POSIX;
+                } else {
+                    fprintf(stderr, "shm_backend must be 'posix' or 'dax' "
+                            "(got '%s')\n", subopts_value);
+                    goto error;
+                }
+                break;
             default:
 #ifdef EXTSTORE
                 // TODO: differentiating response code.
@@ -5990,26 +6008,30 @@ int main (int argc, char **argv) {
             int rc = shm_backend_create(settings.shm_name,
                                         settings.shm_size,
                                         ht_power,
+                                        (shm_backend_t)settings.shm_backend,
                                         (mc_shm_backend_t **)&g_shm_backend);
             if (rc != 0) {
                 fprintf(stderr, "shm_backend_create(%s) failed: %s\n",
                         settings.shm_name, strerror(rc));
                 exit(EXIT_FAILURE);
             }
-            fprintf(stderr, "shm: created region '%s' (%zu MB slab arena, "
+            fprintf(stderr, "shm: created %s region '%s' (%zu MB slab arena, "
                     "hashpower=%u)\n",
+                    settings.shm_backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
                     settings.shm_name,
                     settings.shm_size / (1024 * 1024),
                     ht_power);
         } else {
             int rc = shm_backend_attach(settings.shm_name,
+                                        (shm_backend_t)settings.shm_backend,
                                         (mc_shm_backend_t **)&g_shm_backend);
             if (rc != 0) {
                 fprintf(stderr, "shm_backend_attach(%s) failed: %s\n",
                         settings.shm_name, strerror(rc));
                 exit(EXIT_FAILURE);
             }
-            fprintf(stderr, "shm: attached to region '%s'\n",
+            fprintf(stderr, "shm: attached to %s region '%s'\n",
+                    settings.shm_backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
                     settings.shm_name);
         }
 

@@ -100,9 +100,12 @@ static size_t region_total_size(size_t slab_size, uint32_t ht_power)
 int shm_backend_create(const char    *name,
                        size_t         slab_size,
                        uint32_t       hashtable_power,
+                       shm_backend_t  backend,
                        mc_shm_backend_t **out)
 {
     if (!name || slab_size == 0 || hashtable_power > 30 || !out)
+        return EINVAL;
+    if (backend != SHM_BACKEND_POSIX && backend != SHM_BACKEND_DAX)
         return EINVAL;
 
     mc_shm_backend_t *b = calloc(1, sizeof(*b));
@@ -113,12 +116,30 @@ int shm_backend_create(const char    *name,
 
     /* Create the shm_alloc region */
     shm_region_open_opts_t opts = {
-        .backend      = SHM_BACKEND_POSIX,
+        .backend      = backend,
         .flags        = SHM_OPEN_CREATE,
         .dir_capacity = 16,
     };
-    int rc = shm_region_open(name, total, &opts, &b->region);
+    /*
+     * POSIX: ftruncate to `total` and map that many bytes.
+     * DAX: map the entire device (size=0 → fstat); verify it fits `total`.
+     */
+    size_t open_size = (backend == SHM_BACKEND_DAX) ? 0 : total;
+    int rc = shm_region_open(name, open_size, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }
+
+    if (backend == SHM_BACKEND_DAX) {
+        size_t dev_size = shm_region_size(b->region);
+        if (total > dev_size) {
+            fprintf(stderr,
+                    "shm_backend_create: DAX device '%s' is %zu bytes but "
+                    "%zu bytes are required (slab arena %zu + metadata)\n",
+                    name, dev_size, total, slab_size);
+            shm_region_close(b->region, false);
+            free(b);
+            return ENOSPC;
+        }
+    }
 
     /* Allocate the slab arena */
     uint64_t  slab_id;
@@ -167,17 +188,19 @@ int shm_backend_create(const char    *name,
 }
 
 int shm_backend_attach(const char    *name,
+                       shm_backend_t  backend,
                        mc_shm_backend_t **out)
 {
     if (!name || !out)
+        return EINVAL;
+    if (backend != SHM_BACKEND_POSIX && backend != SHM_BACKEND_DAX)
         return EINVAL;
 
     mc_shm_backend_t *b = calloc(1, sizeof(*b));
     if (!b) return ENOMEM;
 
-    /* Open existing region – shm_alloc will try to map at the creator's VA */
     shm_region_open_opts_t opts = {
-        .backend = SHM_BACKEND_POSIX,
+        .backend = backend,
         .flags   = 0,
     };
     int rc = shm_region_open(name, 0, &opts, &b->region);

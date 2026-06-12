@@ -551,9 +551,10 @@ struct settings {
     int num_napi_ids;   /* maximum number of NAPI IDs */
     char *memory_file;  /* warm restart memory file path */
     /* Shared-memory backend options */
-    char *shm_name;     /* POSIX shm name, e.g. "/memcached_shm" (NULL = disabled) */
+    char *shm_name;     /* POSIX shm name or DAX device path (NULL = disabled) */
     size_t shm_size;    /* total shm slab arena size in bytes (default = maxbytes) */
     bool shm_create;    /* true = create new region (process 1) */
+    int  shm_backend;   /* 0 = POSIX shm_open, 1 = DAX /dev/dax (see SHM_BACKEND_* in shm_alloc.h) */
 #ifdef PROXY
     bool proxy_enabled;
     bool proxy_uring; /* if the proxy should use io_uring */

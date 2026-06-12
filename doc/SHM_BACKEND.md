@@ -1,6 +1,13 @@
 # Shared-memory backend for memcached
 
-This document describes how memcached was modified to store **keys and values** in a single POSIX shared-memory region backed by the `allocator/` **shm_alloc** library. The design targets benchmark evaluation on shared memory and disaggregated (DAX/CXL) memory.
+This document describes how memcached was modified to store **keys and values** in a single shared region backed by the `allocator/` **shm_alloc** library. The design targets benchmark evaluation on POSIX shared memory and **disaggregated / DAX / CXL** memory.
+
+Two storage backends are supported (selected with `-o shm_backend=…`):
+
+| Backend | `-o shm_backend=` | `-o shm_name=` value | Notes |
+|---------|-------------------|----------------------|-------|
+| **POSIX** (default) | `posix` | `/memcached_shm` | `shm_open` + `/dev/shm` |
+| **DAX** | `dax` | `/dev/dax0.0` | Device node; fixed size, no `ftruncate` |
 
 Two processes attach to the same region:
 
@@ -22,6 +29,8 @@ echo 'm4_define([VERSION_NUMBER], [1.6.x-shm])' > version.m4   # once, if missin
 autoreconf -fi && ./configure && make -j$(nproc)
 ```
 
+### POSIX shared memory (default)
+
 **Terminal 1 — creator on port 11211 (load phase):**
 
 ```bash
@@ -38,9 +47,32 @@ autoreconf -fi && ./configure && make -j$(nproc)
 # Run YCSB workload against 127.0.0.1:11212
 ```
 
+### DAX / disaggregated memory
+
+Requires a configured DAX device (e.g. `/dev/dax0.0`) large enough for the slab arena plus metadata (~8 MiB + hash table). The device must be **zeroed or freshly formatted** before the first `shm_create` — the creator initialises the `shm_alloc` region header on the device.
+
+**Terminal 1 — creator on port 11211:**
+
+```bash
+./memcached -p 11211 -U 0 -m 4096 \
+  -o shm_backend=dax,shm_name=/dev/dax0.0,shm_size=4096,shm_create,hashpower=20
+```
+
+**Terminal 2 — attacher on port 11212:**
+
+```bash
+./memcached -p 11212 -U 0 -m 4096 \
+  -o shm_backend=dax,shm_name=/dev/dax0.0,shm_attach
+```
+
+Both processes must pass the **same** `shm_backend` and `shm_name` (device path). DAX devices cannot be `shm_unlink`’d; re-create requires clearing the device or using a fresh region.
+
 Notes:
 
-- `shm_name` **must** start with `/` (POSIX `shm_open` requirement).
+- `shm_name` is the region identifier:
+  - **POSIX:** must start with `/` (e.g. `/memcached_shm`) — `shm_open` requirement.
+  - **DAX:** device path (e.g. `/dev/dax0.0`) — passed to `open(O_RDWR)`.
+- `shm_backend` is `posix` (default) or `dax`.
 - `shm_size` is in **megabytes** (parsed by `-o shm_size=N`).
 - `-m` (`maxbytes`) should match `shm_size` so accounting is consistent.
 - Start the creator first; the attacher blocks until `ctrl->initialized == 1`.
@@ -79,8 +111,9 @@ Notes:
 
 | Token | Argument | Effect |
 |-------|----------|--------|
-| `shm_name` | string | POSIX SHM name, e.g. `/memcached_shm`. **Required** to enable SHM mode. |
-| `shm_size` | integer (MB) | Slab arena size. `0` → use `-m maxbytes`. |
+| `shm_name` | string | Region path: POSIX name (`/memcached_shm`) or DAX device (`/dev/dax0.0`). **Required** to enable SHM mode. |
+| `shm_backend` | `posix` \| `dax` | Storage backend (default: `posix`). Both processes must use the same value. |
+| `shm_size` | integer (MB) | Slab arena size. `0` → use `-m maxbytes`. For DAX, must fit within device size (checked at create). |
 | `shm_create` | none | This process creates and initialises the region (loader). |
 | `shm_attach` | none | This process attaches to an existing region (worker). |
 
@@ -92,6 +125,7 @@ Parsed in `memcached.c` (`settings_init`, option switch ~lines 5610–5630, init
 char  *shm_name;
 size_t shm_size;
 bool   shm_create;
+int    shm_backend;   /* SHM_BACKEND_POSIX (0) or SHM_BACKEND_DAX (1) from shm_alloc.h */
 ```
 
 Global handle:
@@ -135,6 +169,8 @@ All calls are in `shm_backend.c`. User id `1` and `SHM_PERM_DEFAULT` / `SHM_PERM
 
 ### Region open (create path)
 
+**POSIX:**
+
 ```c
 shm_region_open_opts_t opts = {
     .backend      = SHM_BACKEND_POSIX,
@@ -144,13 +180,26 @@ shm_region_open_opts_t opts = {
 shm_region_open(name, total, &opts, &b->region);
 ```
 
-| Parameter | Value | Meaning |
-|-----------|-------|---------|
-| `name` | e.g. `"/memcached_shm"` | POSIX shared memory object name |
-| `total` | `region_total_size(slab_size, ht_power)` | Region bytes: control block + slab arena + hash table + 8 MiB metadata slack, rounded to 2 MiB |
-| `opts.backend` | `SHM_BACKEND_POSIX` | `shm_open` + `mmap(MAP_SHARED)` |
-| `opts.flags` | `SHM_OPEN_CREATE` | Truncate/create; clear object directory |
-| `opts.dir_capacity` | `16` | Max named objects (`slab_arena`, `hashtable`, `shm_ctrl`) |
+**DAX:**
+
+```c
+shm_region_open_opts_t opts = {
+    .backend      = SHM_BACKEND_DAX,
+    .flags        = SHM_OPEN_CREATE,
+    .dir_capacity = 16,
+};
+/* size=0 → fstat device, mmap entire device; then verify total <= dev_size */
+shm_region_open(name, 0, &opts, &b->region);
+```
+
+| Parameter | POSIX | DAX |
+|-----------|-------|-----|
+| `name` | e.g. `"/memcached_shm"` | e.g. `"/dev/dax0.0"` |
+| `size` (create) | `region_total_size(...)` — `ftruncate` to this size | `0` — full device mapped via `fstat` |
+| `opts.backend` | `SHM_BACKEND_POSIX` | `SHM_BACKEND_DAX` |
+| `opts.flags` | `SHM_OPEN_CREATE` | `SHM_OPEN_CREATE` |
+| Underlying API | `shm_open()` + `ftruncate()` | `open(O_RDWR)` — no truncate |
+| Size check | N/A (region sized exactly) | `region_total_size(slab_size, ht_power) <= shm_region_size()` or `ENOSPC` |
 
 ### Heap allocations inside the region
 
@@ -178,13 +227,16 @@ b->ctrl = (shm_control_block_t *)shm_ptr(region, ctrl_off, 1, SHM_PERM_DEFAULT, 
 ### Region open (attach path)
 
 ```c
-shm_region_open_opts_t opts = { .backend = SHM_BACKEND_POSIX, .flags = 0 };
+shm_region_open_opts_t opts = {
+    .backend = backend,   /* SHM_BACKEND_POSIX or SHM_BACKEND_DAX — must match creator */
+    .flags   = 0,
+};
 shm_region_open(name, 0, &opts, &b->region);
 ```
 
 | Parameter | Value | Meaning |
 |-----------|-------|---------|
-| `size` | `0` | Size read from existing region header |
+| `size` | `0` | Size read from existing object (POSIX `fstat`) or DAX device |
 | `flags` | `0` | Do not create; attach only |
 
 ### Lookup by name (attach path)
@@ -223,8 +275,10 @@ Falls back to ordinary `mmap` if `MAP_FIXED_NOREPLACE` is unavailable or fails.
 ### Not used by memcached (available for extensions)
 
 - `shm_free_id`, `shm_resize`, `shm_dir_next`, `shm_lookup` (by id)
-- `SHM_BACKEND_DAX`, `SHM_OPEN_ENFORCE_NS`, `SHM_OPEN_ENFORCE_CGROUP`
+- `SHM_OPEN_ENFORCE_NS`, `SHM_OPEN_ENFORCE_CGROUP`
 - C++ wrappers in `allocator/include/shm_alloc.hpp`
+
+DAX is selected via `-o shm_backend=dax`; memcached passes `SHM_BACKEND_DAX` into `shm_backend_create()` / `shm_backend_attach()`.
 
 See `allocator/README.md` for the full allocator API.
 
@@ -310,13 +364,16 @@ total = sizeof(shm_control_block_t)
 rounded up to 2 MiB
 ```
 
-#### `shm_backend_create(name, slab_size, hashtable_power, out)` (lines 100–167)
+#### `shm_backend_create(name, slab_size, hashtable_power, backend, out)` (lines 100–186)
 
 Sequence documented in [shm_alloc API calls](#shm_alloc-api-calls-used-by-memcached) above, then `init_ctrl()`.
 
-#### `shm_backend_attach(name, out)` (lines 169–246)
+- **`backend`:** `SHM_BACKEND_POSIX` or `SHM_BACKEND_DAX` (from CLI `-o shm_backend=…`).
+- **DAX create:** passes `size=0` to `shm_region_open` so the full device is mapped; fails with `ENOSPC` if `region_total_size(slab_size, ht_power) > shm_region_size()`.
 
-Opens region, `shm_lookup_by_name` × 3, waits on `ctrl->initialized` (1 ms sleep, 30 s timeout).
+#### `shm_backend_attach(name, backend, out)` (lines 188–265)
+
+Opens region with matching `backend`, `shm_lookup_by_name` × 3, waits on `ctrl->initialized` (1 ms sleep, 30 s timeout).
 
 #### `shm_backend_destroy(b, unlink)` (lines 248–253)
 
@@ -449,9 +506,11 @@ Skips local `pthread_mutex_init` for those arrays (already initialised in `init_
 |-------|----------|
 | Hash table growth | Disabled (`assoc_expand` no-op) |
 | `slab_list` growth | Fixed 1024 pages/class (`SLABS_SHM_MAX_LIST`) |
+| DAX device size | Fixed at hardware/config time; `shm_size` must fit in device |
+| DAX re-init | Creator with `shm_create` overwrites region header; device must be cleared for a fresh run |
 | extstore / `-e` | Not integrated with SHM backend |
 | Restart / `-e memory_file` | Incompatible with SHM mode |
-| Pointer safety | Requires successful fixed-VA remap on attach |
+| Pointer safety | Same VA across processes depends on mmap layout (see `allocator/README.md`) |
 | SHM name | Must be enabled explicitly via `-o shm_name=…` |
 
 ---
@@ -475,8 +534,10 @@ memcached_LDADD = -lrt -lpthread
 | Symptom | Cause / fix |
 |---------|-------------|
 | `slab_list full for class N (limit 0)` | Fixed: `slabs_init` must re-wire `slab_list` after `memset(slabclass)` |
-| `shm_backend_create failed` | Name must start with `/`; check `/dev/shm` permissions |
-| Attacher times out | Creator not started or crashed before `initialized=1` |
+| `shm_backend_create failed` (POSIX) | Name must start with `/`; check `/dev/shm` permissions |
+| `shm_backend_create failed` (DAX) | Device too small for `shm_size` + metadata; check `daxctl list` / device size |
+| `shm_backend_create failed` (DAX) | Permission denied on `/dev/dax0.0`; run with appropriate privileges |
+| Attacher times out | Creator not started, wrong `shm_backend`, or wrong device path |
 | Keys missing on port 11212 | Wrong `shm_name`, or attacher started before creator finished init |
 | `mmap MAP_FIXED` failed | ASLR/layout conflict; check `map_base_addr` in region header |
 | OOM despite large `-m` | Set `shm_size` ≥ `-m`; `slabs_init` uses `b->slab_size` in SHM mode |
