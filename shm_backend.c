@@ -133,8 +133,9 @@ int shm_backend_create(const char    *name,
         if (total > dev_size) {
             fprintf(stderr,
                     "shm_backend_create: DAX device '%s' is %zu bytes but "
-                    "%zu bytes are required (slab arena %zu + metadata)\n",
-                    name, dev_size, total, slab_size);
+                    "%zu bytes are required (slab arena %zu + metadata). "
+                    "Check: cat /sys/bus/dax/devices/$(basename %s)/size\n",
+                    name, dev_size, total, slab_size, name);
             shm_region_close(b->region, false);
             free(b);
             return ENOSPC;

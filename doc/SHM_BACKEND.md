@@ -195,7 +195,7 @@ shm_region_open(name, 0, &opts, &b->region);
 | Parameter | POSIX | DAX |
 |-----------|-------|-----|
 | `name` | e.g. `"/memcached_shm"` | e.g. `"/dev/dax0.0"` |
-| `size` (create) | `region_total_size(...)` — `ftruncate` to this size | `0` — full device mapped via `fstat` |
+| `size` (create) | `region_total_size(...)` — `ftruncate` to this size | `0` — full device size from `/sys/bus/dax/devices/<name>/size` (not `fstat`) |
 | `opts.backend` | `SHM_BACKEND_POSIX` | `SHM_BACKEND_DAX` |
 | `opts.flags` | `SHM_OPEN_CREATE` | `SHM_OPEN_CREATE` |
 | Underlying API | `shm_open()` + `ftruncate()` | `open(O_RDWR)` — no truncate |
@@ -535,7 +535,8 @@ memcached_LDADD = -lrt -lpthread
 |---------|-------------|
 | `slab_list full for class N (limit 0)` | Fixed: `slabs_init` must re-wire `slab_list` after `memset(slabclass)` |
 | `shm_backend_create failed` (POSIX) | Name must start with `/`; check `/dev/shm` permissions |
-| `shm_backend_create failed` (DAX) | Device too small for `shm_size` + metadata; check `daxctl list` / device size |
+| `shm_backend_create failed` (DAX) | Wrong device size (was 2 MiB): fixed by reading `/sys/bus/dax/devices/daxX.Y/size`; verify with `cat /sys/bus/dax/devices/dax0.0/size` |
+| `shm_backend_create failed` (DAX) | Device too small for `shm_size` + metadata; reduce `-o shm_size` or use a larger DAX region |
 | `shm_backend_create failed` (DAX) | Permission denied on `/dev/dax0.0`; run with appropriate privileges |
 | Attacher times out | Creator not started, wrong `shm_backend`, or wrong device path |
 | Keys missing on port 11212 | Wrong `shm_name`, or attacher started before creator finished init |
