@@ -139,6 +139,26 @@ AC_ARG_ENABLE(werror,
 AC_ARG_ENABLE(large-client-flags,
   [AS_HELP_STRING([--enable-large-client-flags], [Change client flags from 32bit to 64bit EXPERIMENTAL])])
 
+dnl ── SHM / DAX cache-line flush mode (clwb / cbo) ─────────────────────────
+dnl Default: none — shm_persist() is a compiler barrier only (correct for
+dnl POSIX /dev/shm local testing).  For DAX / CXL persistent memory select:
+dnl   --with-shm-cache=CLWB        (x86-64 write-back)
+dnl   --with-shm-cache=CLFLUSHOPT  (x86-64 flush+invalidate, non-serialising)
+dnl   --with-shm-cache=CLFLUSH     (x86-64 flush+invalidate, serialising)
+dnl   --with-shm-cache=CBO_CLEAN   (RISC-V Zicbom write-back ≈ CLWB)
+dnl   --with-shm-cache=CBO_FLUSH   (RISC-V Zicbom flush+invalidate)
+AC_ARG_WITH([shm-cache],
+  [AS_HELP_STRING([--with-shm-cache=MODE],
+    [Cache flush for SHM/DAX writes: CLFLUSH|CLFLUSHOPT|CLWB|CBO_FLUSH|CBO_CLEAN (default: none)])],
+  [with_shm_cache=$withval], [with_shm_cache=no])
+AS_IF([test "x$with_shm_cache" != "xno" && test "x$with_shm_cache" != "x"],
+  [AS_CASE([$with_shm_cache],
+    [CLFLUSH|CLFLUSHOPT|CLWB|CBO_FLUSH|CBO_CLEAN],
+      [CPPFLAGS="$CPPFLAGS -DSHM_CACHE_$with_shm_cache"
+       AC_MSG_NOTICE([SHM cache flush mode: $with_shm_cache])],
+    [*],
+      [AC_MSG_ERROR([Invalid --with-shm-cache=$with_shm_cache (want CLFLUSH|CLFLUSHOPT|CLWB|CBO_FLUSH|CBO_CLEAN)])])])
+
 dnl **********************************************************************
 dnl DETECT_SASL_CB_GETCONF
 dnl

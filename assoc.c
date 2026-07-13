@@ -174,17 +174,26 @@ void assoc_start_expand(uint64_t curr_items) {
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
 int assoc_insert(item *it, const uint32_t hv) {
     uint64_t oldbucket;
+    item **bucket;
 
 //    assert(assoc_find(ITEM_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
 
     if (expanding &&
         (oldbucket = (hv & hashmask(hashpower - 1))) >= expand_bucket)
     {
-        it->h_next = old_hashtable[oldbucket];
-        old_hashtable[oldbucket] = it;
+        bucket = &old_hashtable[oldbucket];
+        it->h_next = *bucket;
+        *bucket = it;
     } else {
-        it->h_next = primary_hashtable[hv & hashmask(hashpower)];
-        primary_hashtable[hv & hashmask(hashpower)] = it;
+        bucket = &primary_hashtable[hv & hashmask(hashpower)];
+        it->h_next = *bucket;
+        *bucket = it;
+    }
+
+    /* Persist the updated hash-chain head for DAX/CXL visibility. */
+    if (g_shm_backend) {
+        mc_shm_persist(bucket, sizeof(*bucket));
+        mc_shm_persist(&it->h_next, sizeof(it->h_next));
     }
 
     MEMCACHED_ASSOC_INSERT(ITEM_key(it), it->nkey);
@@ -203,6 +212,9 @@ void assoc_delete(const char *key, const size_t nkey, const uint32_t hv) {
         nxt = (*before)->h_next;
         (*before)->h_next = 0;   /* probably pointless, but whatever. */
         *before = nxt;
+        if (g_shm_backend) {
+            mc_shm_persist(before, sizeof(*before));
+        }
         return;
     }
     /* Note:  we never actually get here.  the callers don't delete things

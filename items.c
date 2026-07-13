@@ -554,12 +554,24 @@ int do_item_link(item *it, const uint32_t hv, const uint64_t cas) {
     refcount_incr(it);
     item_stats_sizes_add(it);
 
+    /* Flush item + LRU metadata so remote CXL/DAX hosts see the link. */
+    if (g_shm_backend) {
+        unsigned int id = it->slabs_clsid;
+        mc_shm_persist(it, (size_t)ITEM_ntotal(it));
+        mc_shm_persist(&heads[id], sizeof(heads[id]));
+        mc_shm_persist(&tails[id], sizeof(tails[id]));
+        mc_shm_persist(&sizes[id], sizeof(sizes[id]));
+        mc_shm_persist(&sizes_bytes[id], sizeof(sizes_bytes[id]));
+        mc_shm_drain();
+    }
+
     return 1;
 }
 
 void do_item_unlink(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
+        unsigned int id = it->slabs_clsid;
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
         stats_state.curr_bytes -= ITEM_ntotal(it);
@@ -568,6 +580,14 @@ void do_item_unlink(item *it, const uint32_t hv) {
         item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
         item_unlink_q(it);
+        if (g_shm_backend) {
+            mc_shm_persist(it, (size_t)ITEM_ntotal(it));
+            mc_shm_persist(&heads[id], sizeof(heads[id]));
+            mc_shm_persist(&tails[id], sizeof(tails[id]));
+            mc_shm_persist(&sizes[id], sizeof(sizes[id]));
+            mc_shm_persist(&sizes_bytes[id], sizeof(sizes_bytes[id]));
+            mc_shm_drain();
+        }
         do_item_remove(it);
     }
 }
@@ -576,6 +596,7 @@ void do_item_unlink(item *it, const uint32_t hv) {
 void do_item_unlink_nolock(item *it, const uint32_t hv) {
     MEMCACHED_ITEM_UNLINK(ITEM_key(it), it->nkey, it->nbytes);
     if ((it->it_flags & ITEM_LINKED) != 0) {
+        unsigned int id = it->slabs_clsid;
         it->it_flags &= ~ITEM_LINKED;
         STATS_LOCK();
         stats_state.curr_bytes -= ITEM_ntotal(it);
@@ -584,6 +605,14 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
         item_stats_sizes_remove(it);
         assoc_delete(ITEM_key(it), it->nkey, hv);
         do_item_unlink_q(it);
+        if (g_shm_backend) {
+            mc_shm_persist(it, (size_t)ITEM_ntotal(it));
+            mc_shm_persist(&heads[id], sizeof(heads[id]));
+            mc_shm_persist(&tails[id], sizeof(tails[id]));
+            mc_shm_persist(&sizes[id], sizeof(sizes[id]));
+            mc_shm_persist(&sizes_bytes[id], sizeof(sizes_bytes[id]));
+            mc_shm_drain();
+        }
         do_item_remove(it);
     }
 }
@@ -607,23 +636,42 @@ void do_item_update(item *it) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
         if ((it->it_flags & ITEM_LINKED) != 0) {
             if (ITEM_lruid(it) == COLD_LRU && (it->it_flags & ITEM_ACTIVE)) {
+                unsigned int old_id = it->slabs_clsid;
                 it->time = current_time;
                 item_unlink_q(it);
                 it->slabs_clsid = ITEM_clsid(it);
                 it->slabs_clsid |= WARM_LRU;
                 it->it_flags &= ~ITEM_ACTIVE;
                 item_link_q_warm(it);
+                if (g_shm_backend) {
+                    unsigned int new_id = it->slabs_clsid;
+                    mc_shm_persist(it, sizeof(*it));
+                    mc_shm_persist(&heads[old_id], sizeof(heads[old_id]));
+                    mc_shm_persist(&tails[old_id], sizeof(tails[old_id]));
+                    mc_shm_persist(&heads[new_id], sizeof(heads[new_id]));
+                    mc_shm_persist(&tails[new_id], sizeof(tails[new_id]));
+                    mc_shm_drain();
+                }
             } else {
                 it->time = current_time;
+                if (g_shm_backend)
+                    mc_shm_persist_drain(&it->time, sizeof(it->time));
             }
         }
     } else if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
         assert((it->it_flags & ITEM_SLABBED) == 0);
 
         if ((it->it_flags & ITEM_LINKED) != 0) {
+            unsigned int id = it->slabs_clsid;
             it->time = current_time;
             item_unlink_q(it);
             item_link_q(it);
+            if (g_shm_backend) {
+                mc_shm_persist(it, sizeof(*it));
+                mc_shm_persist(&heads[id], sizeof(heads[id]));
+                mc_shm_persist(&tails[id], sizeof(tails[id]));
+                mc_shm_drain();
+            }
         }
     }
 }

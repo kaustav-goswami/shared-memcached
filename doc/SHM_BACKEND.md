@@ -22,12 +22,31 @@ Both processes share the same slab arena, hash table, LRU lists, CAS counter, an
 
 ## Quick start (YCSB)
 
-Build:
+Build (POSIX `/dev/shm` local testing — default, no hardware cache flushes):
 
 ```bash
+git submodule update --init allocator
 echo 'm4_define([VERSION_NUMBER], [1.6.x-shm])' > version.m4   # once, if missing
-autoreconf -fi && ./configure && make -j$(nproc)
+./autogen.sh && ./configure && make -j$(nproc)
 ```
+
+Build for DAX / CXL with cache write-back on every shared-memory store:
+
+```bash
+# x86-64 (CLWB) — preferred for /dev/dax
+./configure --with-shm-cache=CLWB && make -j$(nproc)
+
+# RISC-V Zicbom (cbo.clean ≈ CLWB)
+./configure --with-shm-cache=CBO_CLEAN && make -j$(nproc)
+```
+
+The allocator submodule is the **capability** version of `shm_alloc` (`shm_cap_t`
+handles for slab_arena / hashtable / shm_ctrl).  Metadata writes inside the
+allocator always call `shm_persist()`; memcached also persists item, hash-bucket,
+and control-block updates via `mc_shm_persist()`.  With the default configure
+(no `--with-shm-cache`), those calls are compiler barriers only — correct for
+coherent `/dev/shm`.  With `CLWB` / `CBO_CLEAN`, each write issues the matching
+instruction plus an `sfence` / `fence`.
 
 ### POSIX shared memory (default)
 
@@ -66,6 +85,27 @@ Requires a configured DAX device (e.g. `/dev/dax0.0`) large enough for the slab 
 ```
 
 Both processes must pass the **same** `shm_backend` and `shm_name` (device path). DAX devices cannot be `shm_unlink`’d; re-create requires clearing the device or using a fresh region.
+
+### Cache write-back (CLWB / CBO) for DAX
+
+Shared-memory stores go through `mc_shm_persist()` / `shm_persist()`. With the
+default `./configure` those calls are compiler barriers only (correct for
+coherent `/dev/shm`). For DAX / CXL, rebuild with an explicit flush mode:
+
+| Target | Configure flag | Instruction |
+|--------|----------------|-------------|
+| x86-64 (preferred) | `--with-shm-cache=CLWB` | `clwb` + `sfence` |
+| x86-64 (Broadwell+) | `--with-shm-cache=CLFLUSHOPT` | `clflushopt` + `sfence` |
+| RISC-V Zicbom | `--with-shm-cache=CBO_CLEAN` | `cbo.clean` + `fence` |
+
+Allocator metadata is flushed automatically; item / hash / LRU / control-block
+updates are flushed from memcached.
+
+### Fixed virtual address
+
+The creator maps the region at a stable VA (default `0x40000000000`, override
+with `SHM_MAP_BASE`). Attachers remap with `MAP_FIXED_NOREPLACE` at that
+address so raw item pointers remain valid across processes / hosts.
 
 Notes:
 

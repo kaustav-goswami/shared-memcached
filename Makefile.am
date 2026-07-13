@@ -33,9 +33,13 @@ memcached_SOURCES = memcached.c memcached.h \
                     proto_bin.c proto_bin.h \
                     shm_backend.c shm_backend.h \
                     allocator/src/shm_alloc.c \
+                    allocator/src/shm_cap.c \
                     allocator/src/shm_ns.c \
                     allocator/src/shm_ns.h \
-                    allocator/include/shm_alloc.h
+                    allocator/src/shm_internal.h \
+                    allocator/src/shm_persist.h \
+                    allocator/include/shm_alloc.h \
+                    allocator/include/shm_cap.h
 
 if BUILD_SOLARIS_PRIVS
 memcached_SOURCES += solaris_priv.c
@@ -94,11 +98,13 @@ memcached_debug_SOURCES = $(memcached_SOURCES)
 memcached_CPPFLAGS = -DNDEBUG
 memcached_debug_LDADD = @PROFILER_LDFLAGS@ -lrt -lpthread
 memcached_debug_CFLAGS = @PROFILER_FLAGS@
-memcached_debug_CPPFLAGS = -I$(srcdir)/allocator/include
+memcached_debug_CPPFLAGS = -I$(srcdir)/allocator/include -I$(srcdir)/allocator/src
 
 memcached_LDADD = -lrt -lpthread
 memcached_LDFLAGS =
-memcached_CPPFLAGS += -I$(srcdir)/allocator/include
+# allocator/include: public shm_alloc.h / shm_cap.h
+# allocator/src:     shm_persist.h / shm_internal.h (used by shm_cap.c and persist helpers)
+memcached_CPPFLAGS += -I$(srcdir)/allocator/include -I$(srcdir)/allocator/src
 memcached_debug_LDFLAGS =
 memcached_DEPENDENCIES =
 memcached_debug_DEPENDENCIES =

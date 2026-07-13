@@ -6170,7 +6170,12 @@ int main (int argc, char **argv) {
 
     /* Signal attaching processes that full initialisation is complete */
     if (g_shm_backend && settings.shm_create) {
-        ((mc_shm_backend_t *)g_shm_backend)->ctrl->initialized = 1;
+        shm_control_block_t *ctrl =
+            ((mc_shm_backend_t *)g_shm_backend)->ctrl;
+        ctrl->initialized = 1;
+        /* Ensure the ready flag is visible on DAX/CXL (clwb/cbo + fence). */
+        mc_shm_persist_drain((const void *)&ctrl->initialized,
+                             sizeof(ctrl->initialized));
         fprintf(stderr, "shm: signalled ready (ctrl->initialized=1)\n");
     }
 

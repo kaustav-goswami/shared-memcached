@@ -2,12 +2,18 @@
 /*
  * shm_backend.h – shared-memory backend for memcached.
  *
- * Wraps the shm_alloc library to provide a single POSIX shared-memory region
+ * Wraps the shm_alloc capability allocator to provide a single shared region
  * that holds all mutable cache state:
  *
  *   - Slab arena   (raw slab pages; items, keys, and values live here)
  *   - Hash table   (primary_hashtable bucket array)
  *   - Control block (slab-class metadata, LRU heads/tails, all locks)
+ *
+ * Named objects are accessed through CHERI-like shm_cap_t capabilities
+ * (derive once, deref on use).  Writes into the region go through
+ * mc_shm_persist() / mc_shm_drain() so that, when built with
+ * --with-shm-cache=CLWB (x86) or CBO_CLEAN (RISC-V), every store is
+ * written back with the matching cache-block instruction.
  *
  * Two processes can attach to the same region and serve different TCP ports
  * while sharing the same live key-value data.  The region is mapped at the
@@ -24,7 +30,8 @@
 #include <stdbool.h>
 #include <pthread.h>
 
-#include "allocator/include/shm_alloc.h"
+#include "shm_alloc.h"
+#include "shm_cap.h"
 #include "slabs_types.h"   /* slabclass_t, SLABS_SHM_MAX_LIST */
 
 /* ── Compile-time constants ─────────────────────────────────────────────── */
@@ -39,6 +46,9 @@
  * Fixed at 13 (8192 buckets) so both processes use the same layout. */
 #define SHM_ITEM_LOCK_HASHPOWER 13
 #define SHM_ITEM_LOCK_COUNT     (1u << SHM_ITEM_LOCK_HASHPOWER)
+
+/* Owner user-id used for all memcached-owned objects in the region. */
+#define SHM_MC_USER_ID          1u
 
 /* ── Shared control block ───────────────────────────────────────────────── */
 
@@ -102,6 +112,11 @@ typedef struct {
 /*
  * Named mc_shm_backend_t to avoid a tag clash with the allocator library's
  * own  typedef enum shm_backend { ... } shm_backend_t;  definition.
+ *
+ * Pointers (ctrl, slab_arena, ht_arena) are obtained by dereferencing the
+ * corresponding capability; they remain valid for the lifetime of the
+ * mapping.  Capabilities are the authoritative handles for permission /
+ * liveness checks.
  */
 typedef struct mc_shm_backend {
     shm_region_t        *region;      /* shm_alloc region handle               */
@@ -111,6 +126,11 @@ typedef struct mc_shm_backend {
     void                *ht_arena;    /* pointer to hash-table bucket array     */
     uint32_t             hashtable_power;
     bool                 is_creator;  /* true if this process created the region */
+
+    /* Capability handles for the three named heap objects */
+    shm_cap_t            slab_cap;
+    shm_cap_t            ht_cap;
+    shm_cap_t            ctrl_cap;
 } mc_shm_backend_t;
 
 /* ── API ─────────────────────────────────────────────────────────────────── */
@@ -152,5 +172,23 @@ int shm_backend_attach(const char       *name,
  * @param unlink If true, shm_unlink() the POSIX shm name (only creator should).
  */
 void shm_backend_destroy(mc_shm_backend_t *b, bool unlink);
+
+/* ── Cache-line persist helpers ──────────────────────────────────────────── */
+
+/**
+ * Write-back / flush cache lines covering [addr, addr+len).
+ * No-op (compiler barrier only) unless built with --with-shm-cache=….
+ * Safe to call when SHM mode is disabled (checks g_shm_backend).
+ */
+void mc_shm_persist(const void *addr, size_t len);
+
+/** Order all preceding mc_shm_persist() calls (SFENCE / fence rw,rw). */
+void mc_shm_drain(void);
+
+/**
+ * Persist a byte range and drain.  Convenience for single-field updates
+ * (e.g. ctrl->initialized, mem_current).
+ */
+void mc_shm_persist_drain(const void *addr, size_t len);
 
 #endif /* SHM_BACKEND_H */

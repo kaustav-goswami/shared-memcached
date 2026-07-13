@@ -664,6 +664,14 @@ static void *memory_allocate(size_t size) {
     }
     mem_malloced += size;
 
+    /* Persist bump-allocator bookkeeping in the shared control block. */
+    if (g_shm_backend && mem_base != NULL) {
+        mc_shm_persist(_mem_current_p, sizeof(*_mem_current_p));
+        mc_shm_persist(_mem_avail_p, sizeof(*_mem_avail_p));
+        mc_shm_persist(_mem_malloced_p, sizeof(*_mem_malloced_p));
+        mc_shm_drain();
+    }
+
     return ret;
 }
 

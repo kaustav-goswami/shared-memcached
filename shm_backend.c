@@ -7,11 +7,16 @@
  *                           region, slab arena, hash table, and all locks.
  *   shm_backend_attach()  – called by process 2+; attaches to an existing
  *                           region and waits for the creator to finish init.
+ *
+ * Named objects are held as shm_cap_t capabilities and dereferenced via
+ * shm_cap_deref().  Payload / control-block stores go through mc_shm_persist()
+ * so DAX builds with --with-shm-cache=CLWB|CBO_CLEAN issue write-backs.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
 #include "shm_backend.h"
+#include "shm_persist.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -21,8 +26,7 @@
 #include <string.h>
 #include <time.h>      /* nanosleep */
 
-/* Include memcached.h for compile-time constant checks only.
- * We forward-declare item in shm_backend.h so the struct body is not needed. */
+/* Include memcached.h for compile-time constant checks and g_shm_backend. */
 #include "memcached.h"
 
 /* Sanity checks: the constants in shm_backend.h must match memcached.h */
@@ -30,6 +34,28 @@ _Static_assert(SHM_MAX_SLAB_CLASSES == MAX_NUMBER_OF_SLAB_CLASSES,
                "SHM_MAX_SLAB_CLASSES does not match MAX_NUMBER_OF_SLAB_CLASSES");
 _Static_assert(SHM_POWER_LARGEST == POWER_LARGEST,
                "SHM_POWER_LARGEST does not match POWER_LARGEST");
+
+/* ── Persist helpers ─────────────────────────────────────────────────────── */
+
+void mc_shm_persist(const void *addr, size_t len)
+{
+    if (!g_shm_backend || !addr || len == 0)
+        return;
+    shm_persist(addr, len);
+}
+
+void mc_shm_drain(void)
+{
+    if (!g_shm_backend)
+        return;
+    shm_drain();
+}
+
+void mc_shm_persist_drain(const void *addr, size_t len)
+{
+    mc_shm_persist(addr, len);
+    mc_shm_drain();
+}
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 
@@ -81,6 +107,10 @@ static void init_ctrl(shm_control_block_t *ctrl,
         init_pshared_mutex(&ctrl->item_locks[i]);
     for (i = 0; i < SHM_POWER_LARGEST; i++)
         init_pshared_mutex(&ctrl->lru_locks[i]);
+
+    /* Persist the freshly initialised control block for DAX visibility. */
+    shm_persist(ctrl, sizeof(*ctrl));
+    shm_drain();
 }
 
 /* Compute total region size given slab and hash-table requirements. */
@@ -93,6 +123,54 @@ static size_t region_total_size(size_t slab_size, uint32_t ht_power)
     size_t total     = ctrl_size + slab_size + ht_size + overhead;
     /* Round up to 2 MB boundary */
     return (total + (2 * 1024 * 1024 - 1)) & ~(size_t)(2 * 1024 * 1024 - 1);
+}
+
+/**
+ * Derive a capability for a named object and dereference it for R/W access.
+ * Returns 0 on success; errno-compatible code on failure.
+ */
+static int derive_named_cap(shm_region_t *region,
+                            const char   *name,
+                            shm_cap_t    *out_cap,
+                            void        **out_ptr)
+{
+    uint64_t  id;
+    shm_off_t off;
+    int rc = shm_lookup_by_name(region, name, SHM_MC_USER_ID, SHM_PERM_ADMIN,
+                                &id, &off);
+    if (rc != 0)
+        return rc;
+
+    *out_cap = shm_cap_derive(region, off, SHM_MC_USER_ID,
+                              SHM_PERM_DEFAULT, SHM_PERM_DEFAULT);
+    if (shm_cap_is_null(*out_cap))
+        return EACCES;
+
+    *out_ptr = shm_cap_deref(region, *out_cap,
+                             (shm_perm_t)(SHM_PERM_READ | SHM_PERM_WRITE));
+    if (!*out_ptr)
+        return EFAULT;
+    return 0;
+}
+
+/**
+ * After shm_alloc: derive a capability from the new offset and deref it.
+ */
+static int derive_new_cap(shm_region_t *region,
+                          shm_off_t     off,
+                          shm_cap_t    *out_cap,
+                          void        **out_ptr)
+{
+    *out_cap = shm_cap_derive(region, off, SHM_MC_USER_ID,
+                              SHM_PERM_DEFAULT, SHM_PERM_DEFAULT);
+    if (shm_cap_is_null(*out_cap))
+        return EACCES;
+
+    *out_ptr = shm_cap_deref(region, *out_cap,
+                             (shm_perm_t)(SHM_PERM_READ | SHM_PERM_WRITE));
+    if (!*out_ptr)
+        return EFAULT;
+    return 0;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
@@ -122,7 +200,7 @@ int shm_backend_create(const char    *name,
     };
     /*
      * POSIX: ftruncate to `total` and map that many bytes.
-     * DAX: map the entire device (size=0 → fstat); verify it fits `total`.
+     * DAX: map the entire device (size=0 → sysfs size); verify it fits `total`.
      */
     size_t open_size = (backend == SHM_BACKEND_DAX) ? 0 : total;
     int rc = shm_region_open(name, open_size, &opts, &b->region);
@@ -142,42 +220,40 @@ int shm_backend_create(const char    *name,
         }
     }
 
-    /* Allocate the slab arena */
+    /* Allocate the slab arena and hold it as a capability */
     uint64_t  slab_id;
     shm_off_t slab_off;
-    rc = shm_alloc(b->region, slab_size, "slab_arena", 1, SHM_PERM_DEFAULT,
-                   1, &slab_id, &slab_off);
+    rc = shm_alloc(b->region, slab_size, "slab_arena", SHM_MC_USER_ID,
+                   SHM_PERM_DEFAULT, 1, &slab_id, &slab_off);
     if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
 
-    b->slab_arena = shm_ptr(b->region, slab_off, 1, SHM_PERM_DEFAULT,
-                            SHM_PERM_READ | SHM_PERM_WRITE);
-    b->slab_size  = slab_size;
+    rc = derive_new_cap(b->region, slab_off, &b->slab_cap, &b->slab_arena);
+    if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
+    b->slab_size = slab_size;
 
     /* Allocate the hash table bucket array (zeroed by shm_alloc) */
     uint64_t  ht_id;
     shm_off_t ht_off;
-    rc = shm_alloc(b->region, ht_size, "hashtable", 1, SHM_PERM_DEFAULT,
-                   2, &ht_id, &ht_off);
+    rc = shm_alloc(b->region, ht_size, "hashtable", SHM_MC_USER_ID,
+                   SHM_PERM_DEFAULT, 2, &ht_id, &ht_off);
     if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
 
-    b->ht_arena        = shm_ptr(b->region, ht_off, 1, SHM_PERM_DEFAULT,
-                                 SHM_PERM_READ | SHM_PERM_WRITE);
+    rc = derive_new_cap(b->region, ht_off, &b->ht_cap, &b->ht_arena);
+    if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
     b->hashtable_power = hashtable_power;
 
     /* Allocate the control block */
     uint64_t  ctrl_id;
     shm_off_t ctrl_off;
     rc = shm_alloc(b->region, sizeof(shm_control_block_t), "shm_ctrl",
-                   1, SHM_PERM_DEFAULT, 3, &ctrl_id, &ctrl_off);
+                   SHM_MC_USER_ID, SHM_PERM_DEFAULT, 3, &ctrl_id, &ctrl_off);
     if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
 
-    b->ctrl = (shm_control_block_t *)shm_ptr(b->region, ctrl_off, 1,
-                                             SHM_PERM_DEFAULT,
-                                             SHM_PERM_READ | SHM_PERM_WRITE);
-    if (!b->ctrl) {
-        shm_region_close(b->region, true);
-        free(b);
-        return EFAULT;
+    {
+        void *ctrl_ptr = NULL;
+        rc = derive_new_cap(b->region, ctrl_off, &b->ctrl_cap, &ctrl_ptr);
+        if (rc != 0) { shm_region_close(b->region, true); free(b); return rc; }
+        b->ctrl = (shm_control_block_t *)ctrl_ptr;
     }
 
     /* Initialise the control block (mutexes, slab_list pointers, zero state) */
@@ -207,45 +283,31 @@ int shm_backend_attach(const char    *name,
     int rc = shm_region_open(name, 0, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }
 
-    /* Locate the control block by name */
-    uint64_t  ctrl_id;
-    shm_off_t ctrl_off;
-    rc = shm_lookup_by_name(b->region, "shm_ctrl", 1, SHM_PERM_ADMIN,
-                            &ctrl_id, &ctrl_off);
-    if (rc != 0) {
-        shm_region_close(b->region, false);
-        free(b);
-        return rc;
+    /* Locate objects by name and bind capabilities */
+    {
+        void *ctrl_ptr = NULL;
+        rc = derive_named_cap(b->region, "shm_ctrl", &b->ctrl_cap, &ctrl_ptr);
+        if (rc != 0) {
+            shm_region_close(b->region, false);
+            free(b);
+            return rc;
+        }
+        b->ctrl = (shm_control_block_t *)ctrl_ptr;
     }
-    b->ctrl = (shm_control_block_t *)shm_ptr(b->region, ctrl_off, 1,
-                                             SHM_PERM_ADMIN,
-                                             SHM_PERM_READ | SHM_PERM_WRITE);
 
-    /* Locate the slab arena */
-    uint64_t  slab_id;
-    shm_off_t slab_off;
-    rc = shm_lookup_by_name(b->region, "slab_arena", 1, SHM_PERM_ADMIN,
-                            &slab_id, &slab_off);
+    rc = derive_named_cap(b->region, "slab_arena", &b->slab_cap, &b->slab_arena);
     if (rc != 0) {
         shm_region_close(b->region, false);
         free(b);
         return rc;
     }
-    b->slab_arena = shm_ptr(b->region, slab_off, 1, SHM_PERM_ADMIN,
-                            SHM_PERM_READ | SHM_PERM_WRITE);
 
-    /* Locate the hash table */
-    uint64_t  ht_id;
-    shm_off_t ht_off;
-    rc = shm_lookup_by_name(b->region, "hashtable", 1, SHM_PERM_ADMIN,
-                            &ht_id, &ht_off);
+    rc = derive_named_cap(b->region, "hashtable", &b->ht_cap, &b->ht_arena);
     if (rc != 0) {
         shm_region_close(b->region, false);
         free(b);
         return rc;
     }
-    b->ht_arena = shm_ptr(b->region, ht_off, 1, SHM_PERM_ADMIN,
-                          SHM_PERM_READ | SHM_PERM_WRITE);
 
     /* Wait until the creator finishes initialisation */
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 1000000 }; /* 1 ms */
@@ -264,6 +326,23 @@ int shm_backend_attach(const char    *name,
     b->slab_size       = b->ctrl->mem_limit;
     b->hashtable_power = b->ctrl->hashpower;
     b->is_creator      = false;
+
+    /*
+     * Memcached stores raw C pointers in the shared slab/hash/LRU state.
+     * Those are only valid if we mapped at the creator's virtual address.
+     */
+    if (b->ctrl->mem_base != b->slab_arena ||
+        b->ctrl->primary_hashtable != b->ht_arena) {
+        fprintf(stderr,
+                "shm_backend_attach: shared region is not mapped at the "
+                "creator's virtual address (creator mem_base=%p local "
+                "slab_arena=%p). Set SHM_MAP_BASE to a free address on both "
+                "hosts, or free the conflicting mapping.\n",
+                b->ctrl->mem_base, b->slab_arena);
+        shm_region_close(b->region, false);
+        free(b);
+        return EBUSY;
+    }
 
     *out = b;
     return 0;
