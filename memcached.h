@@ -552,7 +552,7 @@ struct settings {
     char *memory_file;  /* warm restart memory file path */
     /* Shared-memory backend options */
     char *shm_name;     /* POSIX shm name or DAX device path (NULL = disabled) */
-    size_t shm_size;    /* total shm slab arena size in bytes (default = maxbytes) */
+    size_t shm_size;    /* total shared region size in bytes (default = maxbytes) */
     bool shm_create;    /* true = create new region (process 1) */
     int  shm_backend;   /* 0 = POSIX shm_open, 1 = DAX /dev/dax (see SHM_BACKEND_* in shm_alloc.h) */
 #ifdef PROXY

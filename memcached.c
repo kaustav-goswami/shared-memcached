@@ -280,7 +280,7 @@ static void settings_init(void) {
     settings.num_napi_ids = 0;
     settings.memory_file = NULL;
     settings.shm_name    = NULL;  /* set via -o shm_name=/name to enable SHM backend */
-    settings.shm_size    = 0;     /* 0 = use -m maxbytes for slab arena size */
+    settings.shm_size    = 0;     /* 0 = use -m maxbytes for total region size */
     settings.shm_create  = true;  /* default role when SHM enabled: creator (port 11211) */
     settings.shm_backend = SHM_BACKEND_POSIX;
 #ifdef SOCK_COOKIE_ID
@@ -6015,11 +6015,12 @@ int main (int argc, char **argv) {
                         settings.shm_name, strerror(rc));
                 exit(EXIT_FAILURE);
             }
-            fprintf(stderr, "shm: created %s region '%s' (%zu MB slab arena, "
-                    "hashpower=%u)\n",
+            fprintf(stderr, "shm: created %s region '%s' (%zu MB total, "
+                    "%zu MB slab arena, hashpower=%u)\n",
                     settings.shm_backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
                     settings.shm_name,
-                    settings.shm_size / (1024 * 1024),
+                    ((mc_shm_backend_t *)g_shm_backend)->region_size / (1024 * 1024),
+                    ((mc_shm_backend_t *)g_shm_backend)->slab_size / (1024 * 1024),
                     ht_power);
         } else {
             int rc = shm_backend_attach(settings.shm_name,

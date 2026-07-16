@@ -107,7 +107,8 @@ typedef struct mc_shm_backend {
     shm_region_t        *region;      /* shm_alloc region handle               */
     shm_control_block_t *ctrl;        /* pointer into shared control block      */
     void                *slab_arena;  /* pointer to start of slab arena         */
-    size_t               slab_size;   /* total slab arena bytes                 */
+    size_t               slab_size;   /* carved slab arena bytes                */
+    size_t               region_size; /* total mapped shared region (shm_size)  */
     void                *ht_arena;    /* pointer to hash-table bucket array     */
     uint32_t             hashtable_power;
     bool                 is_creator;  /* true if this process created the region */
@@ -120,14 +121,18 @@ typedef struct mc_shm_backend {
  *
  * @param name            POSIX shm name (e.g. "/memcached_shm") or DAX device
  *                        path (e.g. "/dev/dax0.0").
- * @param slab_size       Bytes to reserve for the slab arena.
+ * @param region_size     Total shared region size in bytes (the gem5/DAX
+ *                        address window).  The slab arena is carved from the
+ *                        remainder after hashtable, control block, and
+ *                        shm_alloc metadata — all DAX-relative offsets stay
+ *                        strictly below region_size.
  * @param hashtable_power Hash-table size = 1 << hashtable_power.
  * @param backend         SHM_BACKEND_POSIX or SHM_BACKEND_DAX.
  * @param out             Receives the backend handle on success.
  * @return 0 on success; errno-compatible code on failure.
  */
 int shm_backend_create(const char       *name,
-                       size_t            slab_size,
+                       size_t            region_size,
                        uint32_t          hashtable_power,
                        shm_backend_t     backend,
                        mc_shm_backend_t **out);

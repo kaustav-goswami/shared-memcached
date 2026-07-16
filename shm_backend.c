@@ -7,6 +7,13 @@
  *                           region, slab arena, hash table, and all locks.
  *   shm_backend_attach()  – called by process 2+; attaches to an existing
  *                           region and waits for the creator to finish init.
+ *
+ * Address-space contract (important for gem5 / DAX):
+ *   settings.shm_size is the TOTAL shared region size.  Every live object
+ *   (shm_alloc metadata, slab arena, hashtable, control block) is placed
+ *   inside [region_base, region_base + region_size).  The slab arena is
+ *   carved from what remains after hashtable + control + a metadata reserve,
+ *   so DAX-relative offsets never exceed the configured window.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -30,6 +37,11 @@ _Static_assert(SHM_MAX_SLAB_CLASSES == MAX_NUMBER_OF_SLAB_CLASSES,
                "SHM_MAX_SLAB_CLASSES does not match MAX_NUMBER_OF_SLAB_CLASSES");
 _Static_assert(SHM_POWER_LARGEST == POWER_LARGEST,
                "SHM_POWER_LARGEST does not match POWER_LARGEST");
+
+/* Bytes reserved inside the region for shm_alloc header/directory, per-object
+ * block headers, alignment slack, and a free-list remainder.  Kept deliberately
+ * generous so carving never overruns the region. */
+#define SHM_META_RESERVE  (8ull * 1024 * 1024)
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 
@@ -83,64 +95,86 @@ static void init_ctrl(shm_control_block_t *ctrl,
         init_pshared_mutex(&ctrl->lru_locks[i]);
 }
 
-/* Compute total region size given slab and hash-table requirements. */
-static size_t region_total_size(size_t slab_size, uint32_t ht_power)
+/* Bytes consumed by hashtable + control block + metadata reserve. */
+static size_t region_fixed_overhead(uint32_t ht_power)
 {
     size_t ht_size   = ((size_t)1 << ht_power) * sizeof(void *);
     size_t ctrl_size = sizeof(shm_control_block_t);
-    /* 8 MB overhead for shm_alloc metadata + directory + alignment slack */
-    size_t overhead  = 8 * 1024 * 1024;
-    size_t total     = ctrl_size + slab_size + ht_size + overhead;
-    /* Round up to 2 MB boundary */
-    return (total + (2 * 1024 * 1024 - 1)) & ~(size_t)(2 * 1024 * 1024 - 1);
+    return ht_size + ctrl_size + (size_t)SHM_META_RESERVE;
+}
+
+/*
+ * Carve the slab arena out of the total region so that
+ *   region_hdr + directory + block headers + slab + ht + ctrl
+ * all fit inside [0, region_size).
+ *
+ * Previously shm_size was treated as the arena size alone; the arena was then
+ * placed after shm_alloc metadata, so item pointers near the end of a "512 MB"
+ * arena had DAX-relative offsets > 512 MB and tripped gem5 bounds checks.
+ */
+static size_t slab_arena_from_region(size_t region_size, uint32_t ht_power)
+{
+    size_t overhead = region_fixed_overhead(ht_power);
+    if (region_size <= overhead)
+        return 0;
+    return region_size - overhead;
 }
 
 /* ── Public API ──────────────────────────────────────────────────────────── */
 
 int shm_backend_create(const char    *name,
-                       size_t         slab_size,
+                       size_t         region_size,
                        uint32_t       hashtable_power,
                        shm_backend_t  backend,
                        mc_shm_backend_t **out)
 {
-    if (!name || slab_size == 0 || hashtable_power > 30 || !out)
+    if (!name || region_size < 4096 || hashtable_power > 30 || !out)
         return EINVAL;
     if (backend != SHM_BACKEND_POSIX && backend != SHM_BACKEND_DAX)
         return EINVAL;
 
+    size_t ht_size   = ((size_t)1 << hashtable_power) * sizeof(void *);
+    size_t slab_size = slab_arena_from_region(region_size, hashtable_power);
+    if (slab_size == 0) {
+        fprintf(stderr,
+                "shm_backend_create: region %zu bytes is too small for "
+                "hashtable (%zu) + control block (%zu) + metadata reserve "
+                "(%llu)\n",
+                region_size, ht_size, sizeof(shm_control_block_t),
+                (unsigned long long)SHM_META_RESERVE);
+        return EINVAL;
+    }
+
     mc_shm_backend_t *b = calloc(1, sizeof(*b));
     if (!b) return ENOMEM;
 
-    size_t total = region_total_size(slab_size, hashtable_power);
-    size_t ht_size = ((size_t)1 << hashtable_power) * sizeof(void *);
-
-    /* Create the shm_alloc region */
+    /*
+     * Map exactly `region_size` bytes for both backends.
+     * POSIX: ftruncate to region_size.
+     * DAX:   mmap the first region_size bytes of the device (must be ≤ capacity;
+     *        enforced inside shm_region_open).
+     *
+     * Do NOT map the entire DAX device when the caller asked for a smaller
+     * window — that would let allocations land past the gem5-visible bound.
+     */
     shm_region_open_opts_t opts = {
         .backend      = backend,
         .flags        = SHM_OPEN_CREATE,
         .dir_capacity = 16,
     };
-    /*
-     * POSIX: ftruncate to `total` and map that many bytes.
-     * DAX: map the entire device (size=0 → fstat); verify it fits `total`.
-     */
-    size_t open_size = (backend == SHM_BACKEND_DAX) ? 0 : total;
-    int rc = shm_region_open(name, open_size, &opts, &b->region);
+    int rc = shm_region_open(name, region_size, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }
 
-    if (backend == SHM_BACKEND_DAX) {
-        size_t dev_size = shm_region_size(b->region);
-        if (total > dev_size) {
-            fprintf(stderr,
-                    "shm_backend_create: DAX device '%s' is %zu bytes but "
-                    "%zu bytes are required (slab arena %zu + metadata). "
-                    "Check: cat /sys/bus/dax/devices/$(basename %s)/size\n",
-                    name, dev_size, total, slab_size, name);
-            shm_region_close(b->region, false);
-            free(b);
-            return ENOSPC;
-        }
+    if (shm_region_size(b->region) < region_size) {
+        fprintf(stderr,
+                "shm_backend_create: mapped only %zu bytes, need %zu\n",
+                shm_region_size(b->region), region_size);
+        shm_region_close(b->region, backend == SHM_BACKEND_POSIX);
+        free(b);
+        return ENOSPC;
     }
+
+    void *region_base = shm_region_base(b->region);
 
     /* Allocate the slab arena */
     uint64_t  slab_id;
@@ -152,6 +186,7 @@ int shm_backend_create(const char    *name,
     b->slab_arena = shm_ptr(b->region, slab_off, 1, SHM_PERM_DEFAULT,
                             SHM_PERM_READ | SHM_PERM_WRITE);
     b->slab_size  = slab_size;
+    b->region_size = region_size;
 
     /* Allocate the hash table bucket array (zeroed by shm_alloc) */
     uint64_t  ht_id;
@@ -174,11 +209,38 @@ int shm_backend_create(const char    *name,
     b->ctrl = (shm_control_block_t *)shm_ptr(b->region, ctrl_off, 1,
                                              SHM_PERM_DEFAULT,
                                              SHM_PERM_READ | SHM_PERM_WRITE);
-    if (!b->ctrl) {
+    if (!b->ctrl || !b->slab_arena || !b->ht_arena) {
         shm_region_close(b->region, true);
         free(b);
         return EFAULT;
     }
+
+    /* Bounds check: every shared object must lie inside the region window. */
+    size_t slab_end = (size_t)((char *)b->slab_arena - (char *)region_base)
+                    + slab_size;
+    size_t ht_end   = (size_t)((char *)b->ht_arena - (char *)region_base)
+                    + ht_size;
+    size_t ctrl_end = (size_t)((char *)b->ctrl - (char *)region_base)
+                    + sizeof(shm_control_block_t);
+    if (slab_end > region_size || ht_end > region_size || ctrl_end > region_size) {
+        fprintf(stderr,
+                "shm_backend_create: internal layout exceeds region_size %zu "
+                "(slab_end=%zu ht_end=%zu ctrl_end=%zu)\n",
+                region_size, slab_end, ht_end, ctrl_end);
+        shm_region_close(b->region, true);
+        free(b);
+        return EFAULT;
+    }
+
+    fprintf(stderr,
+            "shm: layout region=%zu MB  slab_arena=%zu MB "
+            "(off=%zu..%zu)  hashtable=%zu KB  ctrl=%zu KB\n",
+            region_size / (1024 * 1024),
+            slab_size / (1024 * 1024),
+            (size_t)((char *)b->slab_arena - (char *)region_base),
+            slab_end,
+            ht_size / 1024,
+            sizeof(shm_control_block_t) / 1024);
 
     /* Initialise the control block (mutexes, slab_list pointers, zero state) */
     init_ctrl(b->ctrl, b->slab_arena, slab_size, b->ht_arena, hashtable_power);
@@ -262,6 +324,7 @@ int shm_backend_attach(const char    *name,
 
     /* Fill in remaining fields from the now-ready control block */
     b->slab_size       = b->ctrl->mem_limit;
+    b->region_size     = shm_region_size(b->region);
     b->hashtable_power = b->ctrl->hashpower;
     b->is_creator      = false;
 

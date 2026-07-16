@@ -49,7 +49,7 @@ autoreconf -fi && ./configure && make -j$(nproc)
 
 ### DAX / disaggregated memory
 
-Requires a configured DAX device (e.g. `/dev/dax0.0`) large enough for the slab arena plus metadata (~8 MiB + hash table). The device must be **zeroed or freshly formatted** before the first `shm_create` — the creator initialises the `shm_alloc` region header on the device.
+Requires a configured DAX device (e.g. `/dev/dax0.0`) at least as large as `shm_size` (total window). The device must be **zeroed or freshly formatted** before the first `shm_create` — the creator initialises the `shm_alloc` region header on the device. Configure gem5’s DAX/cache window to **`shm_size`**, not the raw device size, if they differ.
 
 **Terminal 1 — creator on port 11211:**
 
@@ -73,8 +73,8 @@ Notes:
   - **POSIX:** must start with `/` (e.g. `/memcached_shm`) — `shm_open` requirement.
   - **DAX:** device path (e.g. `/dev/dax0.0`) — passed to `open(O_RDWR)`.
 - `shm_backend` is `posix` (default) or `dax`.
-- `shm_size` is in **megabytes** (parsed by `-o shm_size=N`).
-- `-m` (`maxbytes`) should match `shm_size` so accounting is consistent.
+- `shm_size` is in **megabytes** (parsed by `-o shm_size=N`) and is the **total** shared region / gem5 DAX window, not the raw item-arena size.
+- `-m` defaults `shm_size` when unset; the usable slab arena is slightly smaller (hashtable + control + ~8 MiB metadata reserve are carved out).
 - Start the creator first; the attacher blocks until `ctrl->initialized == 1`.
 - Stop the attacher before unlinking the region; only the creator should pass `unlink=true` on shutdown (not yet wired to a CLI flag — remove `/dev/shm/memcached_shm` manually if needed).
 
@@ -113,7 +113,7 @@ Notes:
 |-------|----------|--------|
 | `shm_name` | string | Region path: POSIX name (`/memcached_shm`) or DAX device (`/dev/dax0.0`). **Required** to enable SHM mode. |
 | `shm_backend` | `posix` \| `dax` | Storage backend (default: `posix`). Both processes must use the same value. |
-| `shm_size` | integer (MB) | Slab arena size. `0` → use `-m maxbytes`. For DAX, must fit within device size (checked at create). |
+| `shm_size` | integer (MB) | **Total** shared region size (the DAX/gem5 address window). `0` → use `-m maxbytes`. The slab arena is carved from the remainder after hashtable + control + metadata. Must fit within the DAX device. |
 | `shm_create` | none | This process creates and initialises the region (loader). |
 | `shm_attach` | none | This process attaches to an existing region (worker). |
 
@@ -123,7 +123,7 @@ Parsed in `memcached.c` (`settings_init`, option switch ~lines 5610–5630, init
 
 ```c
 char  *shm_name;
-size_t shm_size;
+size_t shm_size;      /* total shared region bytes (DAX/gem5 window) */
 bool   shm_create;
 int    shm_backend;   /* SHM_BACKEND_POSIX (0) or SHM_BACKEND_DAX (1) from shm_alloc.h */
 ```
@@ -188,24 +188,26 @@ shm_region_open_opts_t opts = {
     .flags        = SHM_OPEN_CREATE,
     .dir_capacity = 16,
 };
-/* size=0 → fstat device, mmap entire device; then verify total <= dev_size */
-shm_region_open(name, 0, &opts, &b->region);
+/* Map exactly region_size bytes (≤ device); do not map the whole device. */
+shm_region_open(name, region_size, &opts, &b->region);
 ```
 
 | Parameter | POSIX | DAX |
 |-----------|-------|-----|
 | `name` | e.g. `"/memcached_shm"` | e.g. `"/dev/dax0.0"` |
-| `size` (create) | `region_total_size(...)` — `ftruncate` to this size | `0` — full device size from `/sys/bus/dax/devices/<name>/size` (not `fstat`) |
+| `size` (create) | `region_size` (`shm_size`) — `ftruncate` to this size | `region_size` — mmap first N bytes; must be ≤ device (`ENOSPC` if larger) |
 | `opts.backend` | `SHM_BACKEND_POSIX` | `SHM_BACKEND_DAX` |
 | `opts.flags` | `SHM_OPEN_CREATE` | `SHM_OPEN_CREATE` |
 | Underlying API | `shm_open()` + `ftruncate()` | `open(O_RDWR)` — no truncate |
-| Size check | N/A (region sized exactly) | `region_total_size(slab_size, ht_power) <= shm_region_size()` or `ENOSPC` |
+| Size check | region sized exactly | `region_size <= /sys/bus/dax/devices/<name>/size` |
 
 ### Heap allocations inside the region
 
-Three objects are registered in the directory:
+`slab_size` is carved from `region_size` first; then three objects are registered:
 
 ```c
+slab_size = region_size - ht_size - sizeof(shm_control_block_t) - 8MiB_reserve;
+
 // 1. Slab arena — all item/key/value bytes
 shm_alloc(region, slab_size, "slab_arena", 1, SHM_PERM_DEFAULT, 1, &slab_id, &slab_off);
 b->slab_arena = shm_ptr(region, slab_off, 1, SHM_PERM_DEFAULT, SHM_PERM_READ | SHM_PERM_WRITE);
@@ -217,6 +219,7 @@ b->ht_arena = shm_ptr(region, ht_off, 1, SHM_PERM_DEFAULT, SHM_PERM_READ | SHM_P
 // 3. Control block — metadata + locks + slabclass array
 shm_alloc(region, sizeof(shm_control_block_t), "shm_ctrl", 1, SHM_PERM_DEFAULT, 3, &ctrl_id, &ctrl_off);
 b->ctrl = (shm_control_block_t *)shm_ptr(region, ctrl_off, 1, SHM_PERM_DEFAULT, SHM_PERM_READ | SHM_PERM_WRITE);
+/* assert: end offset of each object ≤ region_size */
 ```
 
 | API | Purpose |
@@ -330,7 +333,8 @@ See `allocator/README.md` for the full allocator API.
 | `region` | `shm_region_t*` handle |
 | `ctrl` | Pointer to shared `shm_ctrl` object |
 | `slab_arena` | Cached pointer to slab heap |
-| `slab_size` | Arena size in bytes |
+| `slab_size` | Carved arena size in bytes (≤ `region_size`) |
+| `region_size` | Total mapped shared region (`shm_size`) |
 | `ht_arena` | Cached pointer to hash buckets |
 | `hashtable_power` | Copy of `hashpower` |
 | `is_creator` | `true` if this process called `shm_backend_create` |
@@ -354,24 +358,30 @@ Required so mutexes in the control block work across processes.
 - For each slab class `i`: `slabclass[i].slab_list = sc_slab_list[i]`, `list_size = SLABS_SHM_MAX_LIST`.
 - Initialise all process-shared mutexes.
 
-#### `region_total_size(slab_size, ht_power)` (lines 87–96)
+#### `slab_arena_from_region(region_size, ht_power)`
 
 ```
-total = sizeof(shm_control_block_t)
-      + slab_size
-      + (2^ht_power) * sizeof(void*)
-      + 8 MiB overhead
-rounded up to 2 MiB
+overhead   = sizeof(shm_control_block_t)
+           + (2^ht_power) * sizeof(void*)
+           + 8 MiB metadata reserve
+slab_arena = region_size - overhead     (fails if region_size ≤ overhead)
 ```
 
-#### `shm_backend_create(name, slab_size, hashtable_power, backend, out)` (lines 100–186)
+The 8 MiB reserve covers the shm_alloc region header, object directory,
+per-object block headers, alignment, and free-list slack so that
+`slab_end_offset ≤ region_size` always holds.
+
+#### `shm_backend_create(name, region_size, hashtable_power, backend, out)`
 
 Sequence documented in [shm_alloc API calls](#shm_alloc-api-calls-used-by-memcached) above, then `init_ctrl()`.
 
+- **`region_size`:** total shared window (`settings.shm_size`).
 - **`backend`:** `SHM_BACKEND_POSIX` or `SHM_BACKEND_DAX` (from CLI `-o shm_backend=…`).
-- **DAX create:** passes `size=0` to `shm_region_open` so the full device is mapped; fails with `ENOSPC` if `region_total_size(slab_size, ht_power) > shm_region_size()`.
+- **Both backends:** `shm_region_open(name, region_size, …)` — map exactly the window.
+- **DAX:** fails with `ENOSPC` if `region_size` exceeds the device capacity from sysfs.
+- **Post-alloc check:** asserts slab / hashtable / ctrl end offsets are `< region_size`.
 
-#### `shm_backend_attach(name, backend, out)` (lines 188–265)
+#### `shm_backend_attach(name, backend, out)`
 
 Opens region with matching `backend`, `shm_lookup_by_name` × 3, waits on `ctrl->initialized` (1 ms sleep, 30 s timeout).
 
@@ -506,7 +516,8 @@ Skips local `pthread_mutex_init` for those arrays (already initialised in `init_
 |-------|----------|
 | Hash table growth | Disabled (`assoc_expand` no-op) |
 | `slab_list` growth | Fixed 1024 pages/class (`SLABS_SHM_MAX_LIST`) |
-| DAX device size | Fixed at hardware/config time; `shm_size` must fit in device |
+| DAX device size | Fixed at hardware/config time; `shm_size` (total window) must fit in device |
+| Item capacity | Slightly less than `shm_size` (hashtable + ctrl + 8 MiB reserve carved out) |
 | DAX re-init | Creator with `shm_create` overwrites region header; device must be cleared for a fresh run |
 | extstore / `-e` | Not integrated with SHM backend |
 | Restart / `-e memory_file` | Incompatible with SHM mode |
@@ -529,19 +540,68 @@ memcached_LDADD = -lrt -lpthread
 
 ---
 
+## gem5 / DAX address-bounds bug (fixed)
+
+### Symptom
+
+With `-m 512 -o shm_size=512,shm_backend=dax,…` on a 1 GiB `/dev/dax` device,
+gem5 crashes on an invalid cache-block address inside the DAX region. Debug
+prints show a DAX-relative offset **greater than 512 MiB**.
+
+### Root cause
+
+`shm_size` was previously treated as the **slab arena payload size only**.
+Layout was:
+
+```
+offset 0
+  ├─ shm_alloc region header + object directory   (~2 KiB)
+  ├─ block header
+  ├─ slab_arena[shm_size]                         ← items live here
+  ├─ hashtable
+  └─ shm_ctrl
+```
+
+Therefore:
+
+1. An item at the end of a “512 MiB” arena sat at roughly
+   `data_offset + sizeof(block_hdr) + 512 MiB` → **offset > 512 MiB**.
+2. Hashtable and control-block accesses were also past the 512 MiB mark.
+3. On DAX create the code mapped the **entire device** (`size=0`), so the
+   allocator was willing to hand out those high offsets even when the
+   gem5-visible / configured window was only `shm_size`.
+
+gem5’s DAX cache path bounds-checks the block address against the configured
+window; offsets ≥ `shm_size` assert as invalid.
+
+### Fix
+
+- `shm_size` is the **total** mapped region (gem5 DAX window).
+- Slab arena = `shm_size − hashtable − ctrl − 8 MiB reserve`.
+- Both POSIX and DAX create paths map **exactly** `shm_size` bytes.
+- Create-time layout logging prints region / arena / end offsets; an internal
+  check rejects any object that would end past `region_size`.
+
+After the fix, every shared pointer’s DAX-relative offset satisfies
+`0 ≤ offset < shm_size`. Usable item capacity is a few MiB below `shm_size`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
 |---------|-------------|
+| gem5 invalid DAX address / offset > `shm_size` | Fixed: see [gem5 / DAX address-bounds bug](#gem5--dax-address-bounds-bug-fixed); rebuild and ensure gem5 window ≥ `shm_size` |
 | `slab_list full for class N (limit 0)` | Fixed: `slabs_init` must re-wire `slab_list` after `memset(slabclass)` |
-| `shm_backend_create failed` (POSIX) | Name must start with `/`; check `/dev/shm` permissions |
+| `shm_backend_create failed` (POSIX) | Name must start with `/`; check `/dev/shm` permissions / size |
 | `shm_backend_create failed` (DAX) | Wrong device size (was 2 MiB): fixed by reading `/sys/bus/dax/devices/daxX.Y/size`; verify with `cat /sys/bus/dax/devices/dax0.0/size` |
-| `shm_backend_create failed` (DAX) | Device too small for `shm_size` + metadata; reduce `-o shm_size` or use a larger DAX region |
+| `shm_backend_create failed` (DAX) | `shm_size` larger than the device; reduce `-o shm_size` or enlarge the DAX region |
+| `region … is too small for hashtable + control` | Increase `shm_size` (need room for ~8 MiB reserve + ht + ctrl) |
 | `shm_backend_create failed` (DAX) | Permission denied on `/dev/dax0.0`; run with appropriate privileges |
 | Attacher times out | Creator not started, wrong `shm_backend`, or wrong device path |
 | Keys missing on port 11212 | Wrong `shm_name`, or attacher started before creator finished init |
 | `mmap MAP_FIXED` failed | ASLR/layout conflict; check `map_base_addr` in region header |
-| OOM despite large `-m` | Set `shm_size` ≥ `-m`; `slabs_init` uses `b->slab_size` in SHM mode |
+| Smaller item capacity than `-m` | Expected: arena is carved from `shm_size`; check the `shm: layout …` stderr line |
 
 ---
 
