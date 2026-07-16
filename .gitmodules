@@ -1,0 +1,4 @@
+[submodule "allocator"]
+	path = allocator
+	url = https://github.com/kaustav-goswami/disagg-shmem-allocator.git
+	branch = memcached
