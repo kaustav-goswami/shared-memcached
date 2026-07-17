@@ -283,6 +283,7 @@ static void settings_init(void) {
     settings.shm_size    = 0;     /* 0 = use -m maxbytes for total region size */
     settings.shm_create  = true;  /* default role when SHM enabled: creator (port 11211) */
     settings.shm_backend = SHM_BACKEND_POSIX;
+    settings.shm_guard_pages = 0; /* set via -o shm_guard[=N] */
 #ifdef SOCK_COOKIE_ID
     settings.sock_cookie_id = 0;
 #endif
@@ -4151,6 +4152,13 @@ static void usage(void) {
     printf("   - proxy_arg:           argument string (file path) to pass to proxy config\n"
             );
 #endif
+    printf("   - shm_name:            enable shared-memory backend (POSIX /name or DAX /dev/daxX.Y)\n"
+           "   - shm_backend:         posix (default) or dax\n"
+           "   - shm_size:            total shared region size in MB (default: -m); gem5 DAX window\n"
+           "   - shm_create/shm_attach: creator vs attacher role\n"
+           "   - shm_guard[=N]:       PROT_NONE guard pages at end of region (default N=16) to\n"
+           "                          catch OOB pointer walks past shm_size (see doc/SHM_BACKEND.md)\n"
+            );
     ssl_help();
     printf("-N, --napi_ids            number of napi ids. see doc/napi_ids.txt for more details\n");
     return;
@@ -4784,6 +4792,7 @@ int main (int argc, char **argv) {
         SHM_CREATE,
         SHM_ATTACH,
         SHM_BACKEND,
+        SHM_GUARD,
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -4853,6 +4862,7 @@ int main (int argc, char **argv) {
         [SHM_CREATE] = "shm_create",
         [SHM_ATTACH] = "shm_attach",
         [SHM_BACKEND] = "shm_backend",
+        [SHM_GUARD]  = "shm_guard",
         NULL
     };
 
@@ -5647,6 +5657,19 @@ int main (int argc, char **argv) {
                     goto error;
                 }
                 break;
+            case SHM_GUARD: {
+                /* shm_guard or shm_guard=N (pages). Default 16 pages = 64 KiB. */
+                uint64_t pages = 16;
+                if (subopts_value != NULL) {
+                    if (!safe_strtoull(subopts_value, &pages) || pages > 1048576) {
+                        fprintf(stderr,
+                                "shm_guard requires a page count (e.g. shm_guard=16)\n");
+                        goto error;
+                    }
+                }
+                settings.shm_guard_pages = (uint32_t)pages;
+                break;
+            }
             default:
 #ifdef EXTSTORE
                 // TODO: differentiating response code.
@@ -6009,6 +6032,7 @@ int main (int argc, char **argv) {
                                         settings.shm_size,
                                         ht_power,
                                         (shm_backend_t)settings.shm_backend,
+                                        settings.shm_guard_pages,
                                         (mc_shm_backend_t **)&g_shm_backend);
             if (rc != 0) {
                 fprintf(stderr, "shm_backend_create(%s) failed: %s\n",
@@ -6016,12 +6040,13 @@ int main (int argc, char **argv) {
                 exit(EXIT_FAILURE);
             }
             fprintf(stderr, "shm: created %s region '%s' (%zu MB total, "
-                    "%zu MB slab arena, hashpower=%u)\n",
+                    "%zu MB slab arena, hashpower=%u, guard_pages=%u)\n",
                     settings.shm_backend == SHM_BACKEND_DAX ? "DAX" : "POSIX",
                     settings.shm_name,
                     ((mc_shm_backend_t *)g_shm_backend)->region_size / (1024 * 1024),
                     ((mc_shm_backend_t *)g_shm_backend)->slab_size / (1024 * 1024),
-                    ht_power);
+                    ht_power,
+                    settings.shm_guard_pages);
         } else {
             int rc = shm_backend_attach(settings.shm_name,
                                         (shm_backend_t)settings.shm_backend,

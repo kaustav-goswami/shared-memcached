@@ -555,6 +555,7 @@ struct settings {
     size_t shm_size;    /* total shared region size in bytes (default = maxbytes) */
     bool shm_create;    /* true = create new region (process 1) */
     int  shm_backend;   /* 0 = POSIX shm_open, 1 = DAX /dev/dax (see SHM_BACKEND_* in shm_alloc.h) */
+    uint32_t shm_guard_pages; /* PROT_NONE guard pages at end of SHM window (0=off) */
 #ifdef PROXY
     bool proxy_enabled;
     bool proxy_uring; /* if the proxy should use io_uring */

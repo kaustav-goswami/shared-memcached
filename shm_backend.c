@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>      /* nanosleep */
+#include <unistd.h>    /* sysconf */
 
 /* Include memcached.h for compile-time constant checks only.
  * We forward-declare item in shm_backend.h so the struct body is not needed. */
@@ -44,6 +45,12 @@ _Static_assert(SHM_POWER_LARGEST == POWER_LARGEST,
 #define SHM_META_RESERVE  (8ull * 1024 * 1024)
 
 /* ── Internal helpers ────────────────────────────────────────────────────── */
+
+static size_t page_size_bytes(void)
+{
+    long p = sysconf(_SC_PAGESIZE);
+    return (p > 0) ? (size_t)p : 4096u;
+}
 
 static void init_pshared_mutex(pthread_mutex_t *m)
 {
@@ -95,26 +102,28 @@ static void init_ctrl(shm_control_block_t *ctrl,
         init_pshared_mutex(&ctrl->lru_locks[i]);
 }
 
-/* Bytes consumed by hashtable + control block + metadata reserve. */
-static size_t region_fixed_overhead(uint32_t ht_power)
+/* Bytes consumed by hashtable + control block + metadata reserve + guards. */
+static size_t region_fixed_overhead(uint32_t ht_power, uint32_t guard_pages)
 {
     size_t ht_size   = ((size_t)1 << ht_power) * sizeof(void *);
     size_t ctrl_size = sizeof(shm_control_block_t);
-    return ht_size + ctrl_size + (size_t)SHM_META_RESERVE;
+    size_t guards    = (size_t)guard_pages * page_size_bytes();
+    return ht_size + ctrl_size + (size_t)SHM_META_RESERVE + guards;
 }
 
 /*
  * Carve the slab arena out of the total region so that
- *   region_hdr + directory + block headers + slab + ht + ctrl
+ *   region_hdr + directory + block headers + slab + ht + ctrl + guards
  * all fit inside [0, region_size).
  *
  * Previously shm_size was treated as the arena size alone; the arena was then
  * placed after shm_alloc metadata, so item pointers near the end of a "512 MB"
  * arena had DAX-relative offsets > 512 MB and tripped gem5 bounds checks.
  */
-static size_t slab_arena_from_region(size_t region_size, uint32_t ht_power)
+static size_t slab_arena_from_region(size_t region_size, uint32_t ht_power,
+                                     uint32_t guard_pages)
 {
-    size_t overhead = region_fixed_overhead(ht_power);
+    size_t overhead = region_fixed_overhead(ht_power, guard_pages);
     if (region_size <= overhead)
         return 0;
     return region_size - overhead;
@@ -126,6 +135,7 @@ int shm_backend_create(const char    *name,
                        size_t         region_size,
                        uint32_t       hashtable_power,
                        shm_backend_t  backend,
+                       uint32_t       guard_pages,
                        mc_shm_backend_t **out)
 {
     if (!name || region_size < 4096 || hashtable_power > 30 || !out)
@@ -134,14 +144,15 @@ int shm_backend_create(const char    *name,
         return EINVAL;
 
     size_t ht_size   = ((size_t)1 << hashtable_power) * sizeof(void *);
-    size_t slab_size = slab_arena_from_region(region_size, hashtable_power);
+    size_t slab_size = slab_arena_from_region(region_size, hashtable_power,
+                                              guard_pages);
     if (slab_size == 0) {
         fprintf(stderr,
                 "shm_backend_create: region %zu bytes is too small for "
                 "hashtable (%zu) + control block (%zu) + metadata reserve "
-                "(%llu)\n",
+                "(%llu) + guard_pages (%u)\n",
                 region_size, ht_size, sizeof(shm_control_block_t),
-                (unsigned long long)SHM_META_RESERVE);
+                (unsigned long long)SHM_META_RESERVE, guard_pages);
         return EINVAL;
     }
 
@@ -152,15 +163,17 @@ int shm_backend_create(const char    *name,
      * Map exactly `region_size` bytes for both backends.
      * POSIX: ftruncate to region_size.
      * DAX:   mmap the first region_size bytes of the device (must be ≤ capacity;
-     *        enforced inside shm_region_open).
+     *        enforced inside shm_region_open).  REQUIRE_FIXED so we never land
+     *        near libc ASLR with a too-large VMA (gem5 PA 0x1839ADF20 class).
      *
      * Do NOT map the entire DAX device when the caller asked for a smaller
      * window — that would let allocations land past the gem5-visible bound.
      */
     shm_region_open_opts_t opts = {
         .backend      = backend,
-        .flags        = SHM_OPEN_CREATE,
+        .flags        = SHM_OPEN_CREATE | SHM_OPEN_REQUIRE_FIXED,
         .dir_capacity = 16,
+        .guard_pages  = guard_pages,
     };
     int rc = shm_region_open(name, region_size, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }
@@ -235,7 +248,7 @@ int shm_backend_create(const char    *name,
     fprintf(stderr,
             "shm: layout region=%zu MB  slab_arena=%zu MB "
             "(off=%zu..%zu)  hashtable=%zu KB  ctrl=%zu KB  VA=%p "
-            "max_end=%zu (must be <= region)\n",
+            "max_end=%zu (must be <= region) guard_pages=%u\n",
             region_size / (1024 * 1024),
             slab_size / (1024 * 1024),
             (size_t)((char *)b->slab_arena - (char *)region_base),
@@ -244,7 +257,8 @@ int shm_backend_create(const char    *name,
             sizeof(shm_control_block_t) / 1024,
             region_base,
             (slab_end > ht_end ? (slab_end > ctrl_end ? slab_end : ctrl_end)
-                               : (ht_end > ctrl_end ? ht_end : ctrl_end)));
+                               : (ht_end > ctrl_end ? ht_end : ctrl_end)),
+            guard_pages);
 
     /* Initialise the control block (mutexes, slab_list pointers, zero state) */
     init_ctrl(b->ctrl, b->slab_arena, slab_size, b->ht_arena, hashtable_power);
@@ -268,7 +282,7 @@ int shm_backend_attach(const char    *name,
 
     shm_region_open_opts_t opts = {
         .backend = backend,
-        .flags   = 0,
+        .flags   = SHM_OPEN_REQUIRE_FIXED,
     };
     int rc = shm_region_open(name, 0, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }

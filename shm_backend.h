@@ -128,6 +128,7 @@ typedef struct mc_shm_backend {
  *                        strictly below region_size.
  * @param hashtable_power Hash-table size = 1 << hashtable_power.
  * @param backend         SHM_BACKEND_POSIX or SHM_BACKEND_DAX.
+ * @param guard_pages     PROT_NONE pages at end of the window (0 = none).
  * @param out             Receives the backend handle on success.
  * @return 0 on success; errno-compatible code on failure.
  */
@@ -135,6 +136,7 @@ int shm_backend_create(const char       *name,
                        size_t            region_size,
                        uint32_t          hashtable_power,
                        shm_backend_t     backend,
+                       uint32_t          guard_pages,
                        mc_shm_backend_t **out);
 
 /**

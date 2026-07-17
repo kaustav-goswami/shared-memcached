@@ -113,9 +113,10 @@ Notes:
 |-------|----------|--------|
 | `shm_name` | string | Region path: POSIX name (`/memcached_shm`) or DAX device (`/dev/dax0.0`). **Required** to enable SHM mode. |
 | `shm_backend` | `posix` \| `dax` | Storage backend (default: `posix`). Both processes must use the same value. |
-| `shm_size` | integer (MB) | **Total** shared region size (the DAX/gem5 address window). `0` → use `-m maxbytes`. The slab arena is carved from the remainder after hashtable + control + metadata. Must fit within the DAX device. |
+| `shm_size` | integer (MB) | **Total** shared region size (the DAX/gem5 address window). `0` → use `-m maxbytes`. The slab arena is carved from the remainder after hashtable + control + metadata (+ guards). Must fit within the DAX device. |
 | `shm_create` | none | This process creates and initialises the region (loader). |
 | `shm_attach` | none | This process attaches to an existing region (worker). |
+| `shm_guard` | optional pages | `shm_guard` or `shm_guard=N` — PROT_NONE pages at the end of the mapped window (default N=16). Catches OOB pointer walks; stored in the region header for attachers. |
 
 Parsed in `memcached.c` (`settings_init`, option switch ~lines 5610–5630, init block ~5975–6152).
 
@@ -545,7 +546,7 @@ memcached_LDADD = -lrt -lpthread
 
 ---
 
-## gem5 / DAX address-bounds bugs (fixed)
+## gem5 / DAX address-bounds bugs
 
 ### Symptom A — layout past `shm_size`
 
@@ -558,34 +559,56 @@ after shm_alloc metadata, so items/hashtable/ctrl sat past the window. DAX
 create also mapped the **entire device**.
 
 **Fix:** `shm_size` is the total mapped window; the slab arena is carved as
-`shm_size − ht − ctrl − 8 MiB reserve`. Create maps exactly `shm_size` bytes.
+`shm_size − ht − ctrl − 8 MiB reserve − guards`. Create maps exactly `shm_size` bytes.
 
-### Symptom B — attacher VA mismatch (e.g. PA `0x1839ADF20`)
+### Symptom B — attacher VA mismatch / over-map (e.g. PA `0x1839ADF20`)
 
 With DAX at `[0x100000000, 0x200000000)` and `-m 2048 -o shm_size=2048`, gem5
-sees a packet for `0x1839ADF20` (offset `0x839ADF20` ≈ **2105 MiB**, ~58 MiB
+sees a packet for `0x1839ADF20` / `0x1839ADF28` (offset ≈ **2105 MiB**, ~58 MiB
 past the 2 GiB window) while YCSB is running.
 
-**Cause:** memcached embeds **raw C pointers** in the shared region
-(`item->next`, hashtable buckets, etc.). The docs required mapping at a fixed
-VA (`map_base_addr` + `MAP_FIXED_NOREPLACE`), but attach used `mmap(NULL)` and
-often mapped the **whole DAX device** first. ASLR then gave the attacher a
-different base than the creator; dereferencing creator pointers produced
-wrong DAX offsets (a ~58 MiB VA skew lands exactly on addresses like
-`0x1839ADF20`). YCSB itself is network-only and does not map DAX — the bad
-access comes from a second memcached (or any attacher) with a mismatched VA.
+**Cause (compound):**
 
-**Fix:**
+1. Memcached embeds **raw C pointers** in the shared region. Attach used
+   `mmap(NULL)` and/or mapped the **whole 4 GiB device**, so ASLR skew turned
+   creator pointers into wrong DAX offsets.
+2. Even with a 2 GiB request, some gem5/guest stacks still establish a VMA
+   larger than `shm_size`. Offsets past 2 GiB stay reachable and produce
+   packets into the unused half of the 4 GiB device (exactly the
+   `0x1839ADF2x` class of crashes). Falling back to an ASLR VA near libc
+   (`0x7f63…`) makes this look like a normal mutex `cmpxchg` in the trace.
 
-- Region header stores `map_base_addr` (shm_alloc version 3).
-- Attach peeks one page for `region_size` / `map_base_addr`, then maps
-  **exactly** that window at the creator VA (`MAP_FIXED_NOREPLACE`).
-- Attach never establishes a full-device VMA.
-- `shm_backend_attach` refuses pointers whose offset falls outside the window.
+**Fix (current):**
+
+- Region header stores `map_base_addr` + `guard_pages` (shm_alloc **version 4**).
+- Create/attach **require** a fixed high VA (`0x4000000000` …); DAX never falls
+  back to `mmap(NULL)`.
+- Map exactly `shm_size`, then **chop** any over-mapped tail (`munmap` past the
+  window) and verify `/proc/self/maps`.
+- Optional `-o shm_guard[=N]`: `mprotect(PROT_NONE)` on the last N pages of the
+  window plus anonymous `PROT_NONE` pages immediately after the VMA so OOB
+  walks SIGSEGV in the guest instead of hitting gem5.
 
 After upgrade: **rebuild memcached + allocator**, **wipe/re-create the DAX
-region** (`shm_create` — old headers are version 2), confirm stderr shows
-`max_end <= region` and `attached … VA=… (fixed)`.
+region** (`shm_create` — old headers are version ≤ 3), confirm stderr shows
+`max_end <= region`, `VA=… (fixed)`, `vma=<shm_size>`, and (if enabled)
+`guards active`.
+
+### Recommended gem5 command line
+
+```bash
+# Creator / loader — 2 GiB window on a 4 GiB device, with guards
+./memcached -p 11211 -U 0 -m 2048 \
+  -o shm_backend=dax,shm_name=/dev/dax0.0,shm_size=2048,shm_create,hashpower=20,shm_guard=256
+
+# Attacher / worker (guards come from the region header)
+./memcached -p 11212 -U 0 -m 2048 \
+  -o shm_backend=dax,shm_name=/dev/dax0.0,shm_attach
+```
+
+Keep gem5’s accessible DAX window **≥ `shm_size`** (here 2 GiB → through
+`0x180000000`). Do not configure the guest to use the full 4 GiB device when
+gem5 only wires the first 2 GiB.
 
 ---
 
@@ -593,13 +616,16 @@ region** (`shm_create` — old headers are version 2), confirm stderr shows
 
 | Symptom | Cause / fix |
 |---------|-------------|
-| gem5 invalid DAX address / offset > `shm_size` | See [gem5 / DAX address-bounds bugs](#gem5--dax-address-bounds-bugs-fixed); rebuild guest binary + allocator, wipe DAX, `shm_create`, confirm `max_end <= region` and attach `VA` is `fixed` |
-| `shm_backend_attach: creator/attacher VA mismatch` | Attacher did not get creator `map_base_addr`; free that VA or disable ASLR for the attacher; never run two creators |
+| gem5 invalid DAX address / offset > `shm_size` | See [gem5 / DAX address-bounds bugs](#gem5--dax-address-bounds-bugs); rebuild guest binary + allocator, wipe DAX, `shm_create`, confirm `vma=` equals `shm_size` and attach is `fixed` |
+| `shm_alloc: chopped N bytes past window` | Over-map detected and removed — good; if it keeps recurring, check gem5 DAX mmap |
+| SIGSEGV in guard page | Software OOB past the usable window; enable/keep `shm_guard` and fix the pointer source |
+| `attach FAILED — cannot map at creator VA` | Fixed VA busy; free `0x4000000000` or disable ASLR for the attacher |
+| `shm_backend_attach: creator/attacher VA mismatch` | Attacher did not get creator `map_base_addr`; never run two creators |
 | `slab_list full for class N (limit 0)` | Fixed: `slabs_init` must re-wire `slab_list` after `memset(slabclass)` |
 | `shm_backend_create failed` (POSIX) | Name must start with `/`; check `/dev/shm` permissions / size |
 | `shm_backend_create failed` (DAX) | Wrong device size (was 2 MiB): fixed by reading `/sys/bus/dax/devices/daxX.Y/size`; verify with `cat /sys/bus/dax/devices/dax0.0/size` |
 | `shm_backend_create failed` (DAX) | `shm_size` larger than the device; reduce `-o shm_size` or enlarge the DAX region |
-| `region … is too small for hashtable + control` | Increase `shm_size` (need room for ~8 MiB reserve + ht + ctrl) |
+| `region … is too small for hashtable + control` | Increase `shm_size` (need room for ~8 MiB reserve + ht + ctrl + guards) |
 | `shm_backend_create failed` (DAX) | Permission denied on `/dev/dax0.0`; run with appropriate privileges |
 | Attacher times out | Creator not started, wrong `shm_backend`, or wrong device path |
 | Keys missing on port 11212 | Wrong `shm_name`, or attacher started before creator finished init |
