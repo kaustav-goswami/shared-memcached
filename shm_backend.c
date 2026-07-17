@@ -234,13 +234,17 @@ int shm_backend_create(const char    *name,
 
     fprintf(stderr,
             "shm: layout region=%zu MB  slab_arena=%zu MB "
-            "(off=%zu..%zu)  hashtable=%zu KB  ctrl=%zu KB\n",
+            "(off=%zu..%zu)  hashtable=%zu KB  ctrl=%zu KB  VA=%p "
+            "max_end=%zu (must be <= region)\n",
             region_size / (1024 * 1024),
             slab_size / (1024 * 1024),
             (size_t)((char *)b->slab_arena - (char *)region_base),
             slab_end,
             ht_size / 1024,
-            sizeof(shm_control_block_t) / 1024);
+            sizeof(shm_control_block_t) / 1024,
+            region_base,
+            (slab_end > ht_end ? (slab_end > ctrl_end ? slab_end : ctrl_end)
+                               : (ht_end > ctrl_end ? ht_end : ctrl_end)));
 
     /* Initialise the control block (mutexes, slab_list pointers, zero state) */
     init_ctrl(b->ctrl, b->slab_arena, slab_size, b->ht_arena, hashtable_power);
@@ -327,6 +331,51 @@ int shm_backend_attach(const char    *name,
     b->region_size     = shm_region_size(b->region);
     b->hashtable_power = b->ctrl->hashpower;
     b->is_creator      = false;
+
+    /*
+     * ctrl->mem_base / primary_hashtable were stored as absolute VAs by the
+     * creator.  shm_ptr() returns addresses relative to *this* process's map.
+     * They must match — otherwise ASLR gave us a different base and following
+     * raw item/hashtable pointers produces wrong DAX offsets (gem5 OOB, e.g.
+     * PA 0x1839ADF20 past a 2 GiB shm_size window).
+     */
+    {
+        void *region_base = shm_region_base(b->region);
+        size_t rsz = b->region_size;
+        size_t slab_off = (size_t)((char *)b->slab_arena - (char *)region_base);
+        size_t ht_off   = (size_t)((char *)b->ht_arena - (char *)region_base);
+        size_t ctrl_off = (size_t)((char *)b->ctrl - (char *)region_base);
+
+        if (b->ctrl->mem_base != b->slab_arena
+                || b->ctrl->primary_hashtable != b->ht_arena) {
+            fprintf(stderr,
+                    "shm_backend_attach: creator/attacher VA mismatch\n"
+                    "  local base=%p  ctrl->mem_base=%p  local slab=%p\n"
+                    "  ctrl->ht=%p  local ht=%p\n"
+                    "  Re-create the region after rebuild; ensure attach maps "
+                    "at the creator VA (see shm_alloc map_base_addr).\n",
+                    region_base, b->ctrl->mem_base, b->slab_arena,
+                    b->ctrl->primary_hashtable, b->ht_arena);
+            shm_region_close(b->region, false);
+            free(b);
+            return EFAULT;
+        }
+
+        if (slab_off + b->slab_size > rsz || ht_off >= rsz || ctrl_off >= rsz) {
+            fprintf(stderr,
+                    "shm_backend_attach: object past region_size %zu "
+                    "(slab_off=%zu ht_off=%zu ctrl_off=%zu)\n",
+                    rsz, slab_off, ht_off, ctrl_off);
+            shm_region_close(b->region, false);
+            free(b);
+            return EFAULT;
+        }
+
+        fprintf(stderr,
+                "shm: attach ok region=%zu MB VA=%p slab_off=%zu ht_off=%zu "
+                "ctrl_off=%zu\n",
+                rsz / (1024 * 1024), region_base, slab_off, ht_off, ctrl_off);
+    }
 
     *out = b;
     return 0;
