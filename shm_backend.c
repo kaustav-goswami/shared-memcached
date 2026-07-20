@@ -188,6 +188,7 @@ int shm_backend_create(const char    *name,
     }
 
     void *region_base = shm_region_base(b->region);
+    b->region_base = region_base;
 
     /* Allocate the slab arena */
     uint64_t  slab_id;
@@ -345,6 +346,7 @@ int shm_backend_attach(const char    *name,
     b->region_size     = shm_region_size(b->region);
     b->hashtable_power = b->ctrl->hashpower;
     b->is_creator      = false;
+    b->region_base     = shm_region_base(b->region);
 
     /*
      * ctrl->mem_base / primary_hashtable were stored as absolute VAs by the
@@ -354,7 +356,7 @@ int shm_backend_attach(const char    *name,
      * PA 0x1839ADF20 past a 2 GiB shm_size window).
      */
     {
-        void *region_base = shm_region_base(b->region);
+        void *region_base = b->region_base;
         size_t rsz = b->region_size;
         size_t slab_off = (size_t)((char *)b->slab_arena - (char *)region_base);
         size_t ht_off   = (size_t)((char *)b->ht_arena - (char *)region_base);

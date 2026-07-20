@@ -1028,6 +1028,7 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv, LIBEVEN
     item *it = assoc_find(key, nkey, hv);
     if (it != NULL) {
         refcount_incr(it);
+        debug_mmap_access(it);
     }
     int was_found = 0;
 

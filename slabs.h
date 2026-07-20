@@ -70,4 +70,11 @@ struct mc_shm_backend;
 void slabs_shm_setup(struct mc_shm_backend *b, bool is_creator);
 void slabs_shm_restore_state(struct mc_shm_backend *b);
 
+#ifdef MEMCACHED_DEBUG
+/* Print mmap base, access VA, and (access - base) on one line. */
+void debug_mmap_access(const void *access);
+#else
+#define debug_mmap_access(access) ((void)0)
+#endif
+
 #endif

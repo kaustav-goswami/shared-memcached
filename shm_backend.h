@@ -105,6 +105,7 @@ typedef struct {
  */
 typedef struct mc_shm_backend {
     shm_region_t        *region;      /* shm_alloc region handle               */
+    void                *region_base; /* mmap base VA of the shared region      */
     shm_control_block_t *ctrl;        /* pointer into shared control block      */
     void                *slab_arena;  /* pointer to start of slab arena         */
     size_t               slab_size;   /* carved slab arena bytes                */

@@ -471,6 +471,7 @@ static void *do_slabs_alloc(unsigned int id,
 
     if (ret) {
         MEMCACHED_SLABS_ALLOCATE(id, p->size, ret);
+        debug_mmap_access(ret);
     } else {
         MEMCACHED_SLABS_ALLOCATE_FAILED(id);
     }
@@ -926,3 +927,25 @@ void slabs_shm_setup(mc_shm_backend_t *b, bool is_creator)
 /* Called after slabs_init() in the attach path – arena state is already live
  * in the control block, so this is a no-op placeholder. */
 void slabs_shm_restore_state(mc_shm_backend_t *b) { (void)b; }
+
+#ifdef MEMCACHED_DEBUG
+void debug_mmap_access(const void *access) {
+    void *base = NULL;
+
+    if (access == NULL)
+        return;
+
+    if (g_shm_backend != NULL && g_shm_backend->region_base != NULL) {
+        base = g_shm_backend->region_base;
+    } else if (mem_base != NULL) {
+        base = mem_base;
+    }
+
+    if (base == NULL)
+        return;
+
+    fprintf(stderr, "mmap_access base=%p access=%p offset=%zd\n",
+            base, access,
+            (ssize_t)((const char *)access - (const char *)base));
+}
+#endif
