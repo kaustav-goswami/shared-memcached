@@ -612,6 +612,181 @@ gem5 only wires the first 2 GiB.
 
 ---
 
+## Address-bounds code audit (line-by-line pass over allocator + shm integration)
+
+This section documents a dedicated audit of every address/offset calculation
+in `allocator/src/shm_alloc.c`, `shm_backend.c`, `slabs.c`, `items.c`,
+`assoc.c`, and `thread.c`, triggered by crashes that reproduced even with
+**zero items** (memaslap with no workload) and **before any GET/SET**
+arrived from YCSB (during connection/startup). Goal: find and patch every
+place a computed address could land outside the region/arena it belongs to,
+independent of the `shm_size` vs. gem5-window sizing issues already covered
+above.
+
+### Methodology
+
+1. Read every pointer/offset helper in `shm_alloc.c` (`blk_at_hoff`,
+   `blk_of_poff`, `hoff_of_blk`, `poff_of_blk`, `dir_slot`, `heap_size`,
+   `region_init`, `install_guard_pages`) and every call site that converts a
+   `shm_off_t` into a raw pointer.
+2. Traced the full memcached shm startup sequence in `memcached.c` (`main`)
+   to see what runs unconditionally at boot before any client I/O:
+   `shm_backend_create` → `slabs_shm_setup` → `items_shm_setup` →
+   `assoc_init` → `slabs_init` (→ `slabs_preallocate` → `do_slabs_newslab` →
+   `memory_allocate`) → `memcached_thread_init` → `init_lru_crawler`.
+3. Checked every redirect of "shared vs. local" state (`slabs.c`'s
+   `_mem_*_p` pointer indirection, `items.c`'s `g_heads`/`g_cas_id_p`,
+   `assoc.c`'s `hashpower`/`primary_hashtable`, `thread.c`'s
+   `item_locks`/`lru_locks`) for ordering bugs and index bounds.
+4. Ruled out `int`/`uint32_t` truncation of the ~4 GiB region size (all
+   offsets in `shm_alloc.h`/`shm_backend.h` are already `size_t`/`shm_off_t`
+   (`uint64_t`); no 32-bit-truncated byte offsets were found).
+5. Applied fixes, then verified with `allocator/tests` (`test_basic`,
+   `test_resize`, `test_multihost` — all pass) and an end-to-end memcached
+   smoke test (POSIX shm backend: `shm_create`, `slabs_preallocate` at
+   startup, then `set`/`get`/`incr`/`delete` over TCP) after rebuilding with
+   `-Wall -Wextra -pedantic` (no new warnings).
+
+### Bug 1 (real, exploitable) — `shm_ptr()` / `shm_block_info()` / `shm_block_set_perms()` dereferenced caller-supplied offsets with **no bounds check**
+
+`blk_of_poff(r, poff)` was pure pointer arithmetic:
+
+```c
+return (shm_block_hdr_t *)(heap_base(r) + poff - sizeof(shm_block_hdr_t));
+```
+
+`shm_ptr()` called this and then unconditionally read `b->magic` inside
+`check_block_access()`. Any offset that was stale, corrupted, or the
+`SHM_OFF_NULL` sentinel (`UINT64_MAX`) turned directly into a pointer that
+could land **far outside** `[heap_base, heap_base + heap_size)` and get
+dereferenced immediately — a classic "address calculation" OOB bug. On a
+tightly-bounded DAX/gem5 window this reliably faults (matches the reported
+symptom); on POSIX/DRAM the same bad offset can instead silently hit
+unrelated heap memory, which is consistent with "normal memcached works,
+DAX crashes" even though the *root cause* here is not DAX-specific.
+
+**Fix:** added `blk_of_poff_checked()` as the single choke point every
+`shm_off_t` must pass through before being dereferenced. It rejects
+`SHM_OFF_NULL`, any offset that would place the block header outside the
+mapped heap, and — once the header is confirmed readable — any block whose
+own `total_size` claims to extend past the end of the heap (catches a
+corrupted/poisoned header before its `payload_cap` is trusted for further
+`memset`/`memcpy`). `shm_ptr()`, `shm_block_info()`, and
+`shm_block_set_perms()` now use it and return `NULL`/`EINVAL` instead of
+dereferencing a wild pointer. `shm_free()` and `shm_resize()` (whose offsets
+come from the trusted internal directory) were also switched to the
+checked variant as a defense-in-depth net against a corrupted directory
+slot.
+
+### Bug 2 (real, latent) — `memory_allocate()` checked `mem_avail` **before** aligning the request
+
+```c
+ret = mem_current;
+if (size > mem_avail) return NULL;          /* checked BEFORE alignment */
+if (size % CHUNK_ALIGN_BYTES)
+    size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
+mem_current = ((char*)mem_current) + size;  /* bumped AFTER alignment  */
+```
+
+If a caller ever requested a size that was not already a multiple of
+`CHUNK_ALIGN_BYTES`, the check used the smaller pre-alignment size while the
+actual bump used the larger, rounded-up size — `mem_current` could advance
+past `mem_base + mem_limit` (the end of the slab arena, which in shm mode
+*is* the shm/DAX-backed window) without `memory_allocate()` ever returning
+`NULL`. This function is called from `slabs_preallocate()` **at startup**,
+before any client connects — matching "crashes on start with no workload".
+With the current default settings (`slab_page_size`, per-class chunk sizes)
+the passed-in size is always already aligned, so this was latent rather
+than actively firing, but it is a genuine bounds-check-ordering bug and is
+now fixed: align first, then check against `mem_avail`, so the bump can
+never exceed what was verified available.
+
+### Bug 3 (defensive) — `region_init()` could silently underflow `heap_sz` for undersized regions
+
+```c
+if (total_size <= data_off + guard_bytes + BLOCK_MIN) {
+    guard_bytes = 0; guard_pages = 0;      /* disables guards and continues */
+}
+...
+size_t heap_sz = total_size - data_off - guard_bytes;   /* size_t underflow if total_size <= data_off */
+```
+
+Disabling guards does not guarantee `total_size > data_off`; a region only
+barely larger than the header + object directory (not reachable through the
+current memcached 4000 MiB configuration, but reachable through the general
+`shm_alloc` API with a large `dir_capacity`) would underflow `heap_sz` to a
+huge `size_t`, and the allocator would hand out a "free block" claiming to
+be several exabytes — every subsequent `shm_alloc()` would then compute
+pointers far outside the mapping. **Fix:** `shm_region_open()` now validates
+`size > header + directory + guard + BLOCK_MIN` up front and returns
+`EINVAL` with a descriptive message; `region_init()` itself was also
+hardened to clamp to an empty (unusable, but never wraparound) heap if this
+is ever reached through another path.
+
+### Observation (not a bug) — DAX in-region trailing guard often fails to apply
+
+`install_guard_pages()` tries to `munmap()` + re-`mmap(PROT_NONE)` the last
+`shm_guard` pages *inside* the DAX window. On the kernels/dax drivers this
+was tested against, the `munmap()` of a slice of a device-DAX VMA returns
+`EINVAL`, so that in-region guard silently does **not** get applied — only
+the post-VMA guard (immediately after the mapping) is active. The allocator
+still never *legally* hands out bytes in that trailing region (`heap_size()`
+excludes it), so this by itself does not cause an OOB write — but it does
+mean a stray OOB write that lands in exactly that window will silently
+succeed instead of SIGSEGV'ing, making such bugs harder to catch. The
+startup log now says so explicitly instead of claiming "guards active":
+
+```
+shm_alloc: WARNING in-region guard NOT enforced — bytes N..M at 0x... remain
+live/writable DAX memory (heap accounting excludes them, but a stray OOB
+write there will not fault); only the post-VMA guard is active
+```
+
+### Reviewed and found safe (no change needed)
+
+- **`assoc_expand()`** is unconditionally disabled in shm mode
+  (`if (g_shm_backend) return;`), so `hashpower` / `primary_hashtable`
+  (copied once into process-local statics rather than pointer-indirected)
+  never actually diverge from the control block today. This is fragile if a
+  future code path called `assoc_expand()` unconditionally, but is not
+  implicated in the current crashes.
+- **`item_lock()` / `item_trylock()` / `item_unlock()`** always mask with
+  `hashmask(item_lock_hashpower)` where `item_lock_hashpower` is fixed at
+  `SHM_ITEM_LOCK_HASHPOWER` (13) in shm mode and `item_locks` is sized
+  `1 << 13`; any `hv` value is safe by construction. `memcached_thread_init()`
+  redirects `item_locks`/`item_lock_hashpower` before any worker thread is
+  spawned, so there is no ordering window where a thread could index with
+  stale bounds.
+- **`shm_resize()`'s in-place-growth check**
+  (`next_ho + sizeof(shm_block_hdr_t) < heap_size(region)`) is conservative
+  (refuses growth one byte earlier than strictly necessary) but never reads
+  past the heap — the strict `<` only rejects a valid case, it does not
+  admit an invalid one.
+- No `uint32_t`-truncated byte offsets were found for the ~4 GiB region
+  size case; every offset/size in the allocator and `shm_backend.h` is
+  `size_t` or the explicit 64-bit `shm_off_t`.
+
+### Caveat: this audit does not rule out the previously-identified gem5 issue
+
+A separate, earlier investigation in this same session traced a crash to
+gem5's **classic cache hierarchy mishandling locked RMW (`lock cmpxchg`)
+completions** — reproduced even for a plain **DRAM** address with caches
+enabled, and resolved by removing caches entirely. That is a gem5-side bug
+in the simulated memory system, not an address-calculation bug in
+memcached/`shm_alloc`. Since every process-shared mutex lock (`slabs_lock`,
+`cas_id_lock`, `item_locks[]`, the `shm_alloc` region mutex) compiles to a
+`lock cmpxchg` on `pthread_mutex_lock()`, **any** of the locking that
+happens during connection setup or startup (e.g. `region_lock()` inside
+`shm_alloc()` while carving `slab_arena`/`hashtable`/`shm_ctrl`, or
+`slabs_lock` during `slabs_preallocate()`) can trip that gem5 bug
+independent of whether the target address is in-bounds. If the fixes in
+this section do not fully resolve the crash, the next step is to correlate
+the exact crashing PA/VA against the ranges validated here — if it falls
+inside a legitimately-owned block, the remaining cause is the gem5 cache
+LockedRMW path, not memcached.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |

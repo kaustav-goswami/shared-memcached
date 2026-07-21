@@ -647,13 +647,26 @@ static void *memory_allocate(size_t size) {
     } else {
         ret = mem_current;
 
-        if (size > mem_avail) {
-            return NULL;
-        }
-
-        /* mem_current pointer _must_ be aligned!!! */
+        /*
+         * mem_current pointer _must_ be aligned!!!
+         *
+         * Bounds check bug: this used to check `size > mem_avail` BEFORE
+         * rounding size up to CHUNK_ALIGN_BYTES, then bump mem_current /
+         * mem_avail by the (possibly larger) rounded size below. If the
+         * caller's request was not already a multiple of
+         * CHUNK_ALIGN_BYTES, the aligned size could exceed mem_avail even
+         * though the check just passed -- advancing mem_current past
+         * mem_base + mem_limit, i.e. past the end of the arena (the
+         * shm/DAX-backed slab arena in shm mode) without ever returning
+         * NULL. Align first, then check, so the bump below can never
+         * exceed what was actually verified available.
+         */
         if (size % CHUNK_ALIGN_BYTES) {
             size += CHUNK_ALIGN_BYTES - (size % CHUNK_ALIGN_BYTES);
+        }
+
+        if (size > mem_avail) {
+            return NULL;
         }
 
         mem_current = ((char*)mem_current) + size;
