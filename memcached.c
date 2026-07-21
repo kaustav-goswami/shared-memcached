@@ -2008,13 +2008,22 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
     if (add_stats != NULL) {
         if (!stat_type) {
             /* prepare general statistics for the engine */
+            if (g_shm_backend && settings.verbose > 1)
+                shm_debug_trace("get_stats: before STATS_LOCK", NULL);
             STATS_LOCK();
             APPEND_STAT("bytes", "%llu", (unsigned long long)stats_state.curr_bytes);
             APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
             APPEND_STAT("total_items", "%llu", (unsigned long long)stats.total_items);
             STATS_UNLOCK();
+            if (g_shm_backend && settings.verbose > 1)
+                shm_debug_trace("get_stats: before global_page_pool_size",
+                                g_shm_backend->ctrl);
             APPEND_STAT("slab_global_page_pool", "%u", global_page_pool_size(NULL));
+            if (g_shm_backend && settings.verbose > 1)
+                shm_debug_trace("get_stats: before item_stats_totals", NULL);
             item_stats_totals(add_stats, c);
+            if (g_shm_backend && settings.verbose > 1)
+                shm_debug_trace("get_stats: item_stats_totals done", NULL);
         } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
             item_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "slabs") == 0) {

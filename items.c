@@ -784,6 +784,13 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
         int i;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
+            if (g_shm_backend && settings.verbose > 1 &&
+                ((n == 0 && x == 0) || i == 255)) {
+                char step[64];
+                snprintf(step, sizeof(step),
+                         "item_stats_totals: lock lru_locks[%d] (n=%d x=%d)", i, n, x);
+                shm_debug_trace(step, &lru_locks[i]);
+            }
             pthread_mutex_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.reclaimed += itemstats[i].reclaimed;

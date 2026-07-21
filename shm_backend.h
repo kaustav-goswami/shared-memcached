@@ -161,4 +161,7 @@ int shm_backend_attach(const char       *name,
  */
 void shm_backend_destroy(mc_shm_backend_t *b, bool unlink);
 
+/** Log a shared-memory access step (no-op when addr is NULL). */
+void shm_debug_trace(const char *step, const void *addr);
+
 #endif /* SHM_BACKEND_H */

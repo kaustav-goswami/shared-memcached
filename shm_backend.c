@@ -403,3 +403,26 @@ void shm_backend_destroy(mc_shm_backend_t *b, bool unlink)
     shm_region_close(b->region, unlink);
     free(b);
 }
+
+void shm_debug_trace(const char *step, const void *addr)
+{
+    if (step == NULL)
+        return;
+
+    if (g_shm_backend == NULL || g_shm_backend->region_base == NULL) {
+        fprintf(stderr, "shm_trace: %s (private memory", step);
+        if (addr != NULL)
+            fprintf(stderr, ", addr=%p", addr);
+        fprintf(stderr, ")\n");
+        return;
+    }
+
+    if (addr == NULL) {
+        fprintf(stderr, "shm_trace: %s\n", step);
+        return;
+    }
+
+    ssize_t off = (const char *)addr - (const char *)g_shm_backend->region_base;
+    fprintf(stderr, "shm_trace: %s addr=%p region_off=%zd region_size=%zu\n",
+            step, addr, off, g_shm_backend->region_size);
+}
