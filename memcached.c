@@ -6205,8 +6205,11 @@ int main (int argc, char **argv) {
 
     /* Signal attaching processes that full initialisation is complete */
     if (g_shm_backend && settings.shm_create) {
-        ((mc_shm_backend_t *)g_shm_backend)->ctrl->initialized = 1;
+        mc_shm_backend_t *b = (mc_shm_backend_t *)g_shm_backend;
+        b->ctrl->initialized = 1;
         fprintf(stderr, "shm: signalled ready (ctrl->initialized=1)\n");
+        shm_debug_mutex_words("slabs_lock at ready", &b->ctrl->slabs_lock);
+        shm_debug_mutex_trylock("slabs_lock at ready", &b->ctrl->slabs_lock);
     }
 
     if (settings.idle_timeout && start_conn_timeout_thread() == -1) {

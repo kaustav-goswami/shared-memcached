@@ -167,4 +167,7 @@ void shm_debug_trace(const char *step, const void *addr);
 /** Dump the raw words of a pthread_mutex_t (for pshared init debugging). */
 void shm_debug_mutex_words(const char *label, const pthread_mutex_t *m);
 
+/** Log pthread_mutex_trylock result without leaving the mutex held. */
+void shm_debug_mutex_trylock(const char *label, pthread_mutex_t *m);
+
 #endif /* SHM_BACKEND_H */

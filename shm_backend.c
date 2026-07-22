@@ -469,3 +469,17 @@ void shm_debug_mutex_words(const char *label, const pthread_mutex_t *m)
         fprintf(stderr, " %u", w[i]);
     fprintf(stderr, " (plain_read[0]=%u)\n", w[0]);
 }
+
+void shm_debug_mutex_trylock(const char *label, pthread_mutex_t *m)
+{
+    int rc;
+
+    if (label == NULL || m == NULL)
+        return;
+
+    rc = pthread_mutex_trylock(m);
+    fprintf(stderr, "shm_mutex: %s trylock rc=%d (%s)\n",
+            label, rc, rc == 0 ? "ok" : strerror(rc));
+    if (rc == 0)
+        pthread_mutex_unlock(m);
+}
