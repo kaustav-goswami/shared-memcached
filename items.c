@@ -779,23 +779,19 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
     itemstats_t totals;
     memset(&totals, 0, sizeof(itemstats_t));
     int n;
+    bool lock_lru = (g_shm_backend == NULL);
+
     for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
         int x;
         int i;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            if (g_shm_backend && settings.verbose > 1 &&
-                ((n == 0 && x == 0) || i == 255)) {
-                char step[64];
-                snprintf(step, sizeof(step),
-                         "item_stats_totals: lock lru_locks[%d] (n=%d x=%d)", i, n, x);
-                shm_debug_trace(step, &lru_locks[i]);
-                if (n == 0 && x == 0)
-                    shm_debug_mutex_words("lru_locks[0] pre-lock", &lru_locks[i]);
+            if (lock_lru) {
+                pthread_mutex_lock(&lru_locks[i]);
+            } else if (g_shm_backend && settings.verbose > 1 && n == 0 && x == 0) {
+                shm_debug_trace("item_stats_totals: shm workaround (skip lru_locks)",
+                                NULL);
             }
-            pthread_mutex_lock(&lru_locks[i]);
-            if (g_shm_backend && settings.verbose > 1 && n == 0 && x == 0)
-                shm_debug_trace("item_stats_totals: lru_locks[0] acquired", NULL);
             totals.evicted += itemstats[i].evicted;
             totals.reclaimed += itemstats[i].reclaimed;
             totals.expired_unfetched += itemstats[i].expired_unfetched;
@@ -808,7 +804,8 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
             totals.moves_to_warm += itemstats[i].moves_to_warm;
             totals.moves_within_lru += itemstats[i].moves_within_lru;
             totals.direct_reclaims += itemstats[i].direct_reclaims;
-            pthread_mutex_unlock(&lru_locks[i]);
+            if (lock_lru)
+                pthread_mutex_unlock(&lru_locks[i]);
         }
     }
     APPEND_STAT("expired_unfetched", "%llu",
