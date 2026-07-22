@@ -59,7 +59,9 @@ static void init_pshared_mutex(pthread_mutex_t *m, const char *name)
 
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
-    pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
+    /* Non-robust: PTHREAD_MUTEX_ROBUST triggers per-thread robust-list
+     * registration on first worker lock; that path hangs on DAX under gem5
+     * timing mode even when trylock from the main thread succeeds. */
     rc = pthread_mutex_init(m, &attr);
     if (rc != 0) {
         fprintf(stderr, "shm: pthread_mutex_init(%s) failed: %s\n",
