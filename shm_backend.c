@@ -52,13 +52,19 @@ static size_t page_size_bytes(void)
     return (p > 0) ? (size_t)p : 4096u;
 }
 
-static void init_pshared_mutex(pthread_mutex_t *m)
+static void init_pshared_mutex(pthread_mutex_t *m, const char *name)
 {
     pthread_mutexattr_t attr;
+    int rc;
+
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
     pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
-    pthread_mutex_init(m, &attr);
+    rc = pthread_mutex_init(m, &attr);
+    if (rc != 0) {
+        fprintf(stderr, "shm: pthread_mutex_init(%s) failed: %s\n",
+                name ? name : "?", strerror(rc));
+    }
     pthread_mutexattr_destroy(&attr);
 }
 
@@ -94,12 +100,24 @@ static void init_ctrl(shm_control_block_t *ctrl,
     }
 
     /* Initialise all process-shared mutexes */
-    init_pshared_mutex(&ctrl->slabs_lock);
-    init_pshared_mutex(&ctrl->cas_id_lock);
+    init_pshared_mutex(&ctrl->slabs_lock, "slabs_lock");
+    init_pshared_mutex(&ctrl->cas_id_lock, "cas_id_lock");
     for (i = 0; i < SHM_ITEM_LOCK_COUNT; i++)
-        init_pshared_mutex(&ctrl->item_locks[i]);
+        init_pshared_mutex(&ctrl->item_locks[i],
+                           i == 0 ? "item_locks[0]" : NULL);
     for (i = 0; i < SHM_POWER_LARGEST; i++)
-        init_pshared_mutex(&ctrl->lru_locks[i]);
+        init_pshared_mutex(&ctrl->lru_locks[i],
+                           i == 0 ? "lru_locks[0]" : NULL);
+
+    shm_debug_mutex_words("slabs_lock post-init", &ctrl->slabs_lock);
+    shm_debug_mutex_words("lru_locks[0] post-init", &ctrl->lru_locks[0]);
+    fprintf(stderr,
+            "shm: ctrl=%p slabs_lock=%p (ctrl+%zu bytes) "
+            "lru_locks[0]=%p (ctrl+%zu bytes)\n",
+            (void *)ctrl, (void *)&ctrl->slabs_lock,
+            (size_t)((char *)&ctrl->slabs_lock - (char *)ctrl),
+            (void *)&ctrl->lru_locks[0],
+            (size_t)((char *)&ctrl->lru_locks[0] - (char *)ctrl));
 }
 
 /* Bytes consumed by hashtable + control block + metadata reserve + guards. */
@@ -425,4 +443,29 @@ void shm_debug_trace(const char *step, const void *addr)
     ssize_t off = (const char *)addr - (const char *)g_shm_backend->region_base;
     fprintf(stderr, "shm_trace: %s addr=%p region_off=%zd region_size=%zu\n",
             step, addr, off, g_shm_backend->region_size);
+}
+
+void shm_debug_mutex_words(const char *label, const pthread_mutex_t *m)
+{
+    const unsigned int *w;
+    size_t nwords;
+    size_t i;
+
+    if (label == NULL || m == NULL)
+        return;
+
+    w = (const unsigned int *)m;
+    nwords = sizeof(pthread_mutex_t) / sizeof(unsigned int);
+    if (nwords > 10)
+        nwords = 10;
+
+    fprintf(stderr, "shm_mutex: %s", label);
+    if (g_shm_backend != NULL && g_shm_backend->region_base != NULL) {
+        ssize_t off = (const char *)m - (const char *)g_shm_backend->region_base;
+        fprintf(stderr, " addr=%p region_off=%zd", (const void *)m, off);
+    }
+    fprintf(stderr, " words:");
+    for (i = 0; i < nwords; i++)
+        fprintf(stderr, " %u", w[i]);
+    fprintf(stderr, " (plain_read[0]=%u)\n", w[0]);
 }

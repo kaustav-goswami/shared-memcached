@@ -790,8 +790,12 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
                 snprintf(step, sizeof(step),
                          "item_stats_totals: lock lru_locks[%d] (n=%d x=%d)", i, n, x);
                 shm_debug_trace(step, &lru_locks[i]);
+                if (n == 0 && x == 0)
+                    shm_debug_mutex_words("lru_locks[0] pre-lock", &lru_locks[i]);
             }
             pthread_mutex_lock(&lru_locks[i]);
+            if (g_shm_backend && settings.verbose > 1 && n == 0 && x == 0)
+                shm_debug_trace("item_stats_totals: lru_locks[0] acquired", NULL);
             totals.evicted += itemstats[i].evicted;
             totals.reclaimed += itemstats[i].reclaimed;
             totals.expired_unfetched += itemstats[i].expired_unfetched;

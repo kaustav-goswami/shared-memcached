@@ -575,9 +575,13 @@ void fill_slab_stats_automove(slab_stats_automove *am) {
  */
 unsigned int global_page_pool_size(bool *mem_flag) {
     unsigned int ret = 0;
-    if (g_shm_backend && settings.verbose > 1)
+    if (g_shm_backend && settings.verbose > 1) {
         shm_debug_trace("global_page_pool: lock slabs_lock", slabs_lock_p);
+        shm_debug_mutex_words("slabs_lock pre-lock", slabs_lock_p);
+    }
     pthread_mutex_lock(slabs_lock_p);
+    if (g_shm_backend && settings.verbose > 1)
+        shm_debug_trace("global_page_pool: slabs_lock acquired", NULL);
     if (mem_flag != NULL)
         *mem_flag = mem_malloced >= mem_limit ? true : false;
     if (g_shm_backend && settings.verbose > 1)

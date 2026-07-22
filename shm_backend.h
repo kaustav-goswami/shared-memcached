@@ -164,4 +164,7 @@ void shm_backend_destroy(mc_shm_backend_t *b, bool unlink);
 /** Log a shared-memory access step (no-op when addr is NULL). */
 void shm_debug_trace(const char *step, const void *addr);
 
+/** Dump the raw words of a pthread_mutex_t (for pshared init debugging). */
+void shm_debug_mutex_words(const char *label, const pthread_mutex_t *m);
+
 #endif /* SHM_BACKEND_H */
