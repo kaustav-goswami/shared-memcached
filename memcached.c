@@ -6050,6 +6050,7 @@ int main (int argc, char **argv) {
         } else {
             int rc = shm_backend_attach(settings.shm_name,
                                         (shm_backend_t)settings.shm_backend,
+                                        settings.shm_size,
                                         (mc_shm_backend_t **)&g_shm_backend);
             if (rc != 0) {
                 fprintf(stderr, "shm_backend_attach(%s) failed: %s\n",

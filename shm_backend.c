@@ -256,6 +256,7 @@ int shm_backend_create(const char    *name,
 
 int shm_backend_attach(const char    *name,
                        shm_backend_t  backend,
+                       size_t         region_size,
                        mc_shm_backend_t **out)
 {
     if (!name || !out)
@@ -270,7 +271,7 @@ int shm_backend_attach(const char    *name,
         .backend = backend,
         .flags   = SHM_OPEN_REQUIRE_FIXED,
     };
-    int rc = shm_region_open(name, 0, &opts, &b->region);
+    int rc = shm_region_open(name, region_size, &opts, &b->region);
     if (rc != 0) { free(b); return rc; }
 
     /* Locate the control block by name */

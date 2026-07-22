@@ -139,13 +139,16 @@ int shm_backend_create(const char       *name,
  * Attach to an existing shared-memory region created by another process.
  * Blocks until the creator sets ctrl->initialized = 1.
  *
- * @param name    POSIX shm name or DAX device path used by the creator.
- * @param backend SHM_BACKEND_POSIX or SHM_BACKEND_DAX (must match creator).
- * @param out     Receives the backend handle on success.
+ * @param name         POSIX shm name or DAX device path used by the creator.
+ * @param backend      SHM_BACKEND_POSIX or SHM_BACKEND_DAX (must match creator).
+ * @param region_size  Total region bytes (same as creator's -m / shm_size).
+ *                     Required for DAX attach when the device rejects pread().
+ * @param out          Receives the backend handle on success.
  * @return 0 on success; errno-compatible code on failure.
  */
 int shm_backend_attach(const char       *name,
                        shm_backend_t     backend,
+                       size_t            region_size,
                        mc_shm_backend_t **out);
 
 /**
