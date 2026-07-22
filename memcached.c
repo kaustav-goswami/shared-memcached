@@ -2008,22 +2008,13 @@ bool get_stats(const char *stat_type, int nkey, ADD_STAT add_stats, void *c) {
     if (add_stats != NULL) {
         if (!stat_type) {
             /* prepare general statistics for the engine */
-            if (g_shm_backend && settings.verbose > 1)
-                shm_debug_trace("get_stats: before STATS_LOCK", NULL);
             STATS_LOCK();
             APPEND_STAT("bytes", "%llu", (unsigned long long)stats_state.curr_bytes);
             APPEND_STAT("curr_items", "%llu", (unsigned long long)stats_state.curr_items);
             APPEND_STAT("total_items", "%llu", (unsigned long long)stats.total_items);
             STATS_UNLOCK();
-            if (g_shm_backend && settings.verbose > 1)
-                shm_debug_trace("get_stats: before global_page_pool_size",
-                                g_shm_backend->ctrl);
             APPEND_STAT("slab_global_page_pool", "%u", global_page_pool_size(NULL));
-            if (g_shm_backend && settings.verbose > 1)
-                shm_debug_trace("get_stats: before item_stats_totals", NULL);
             item_stats_totals(add_stats, c);
-            if (g_shm_backend && settings.verbose > 1)
-                shm_debug_trace("get_stats: item_stats_totals done", NULL);
         } else if (nz_strcmp(nkey, stat_type, "items") == 0) {
             item_stats(add_stats, c);
         } else if (nz_strcmp(nkey, stat_type, "slabs") == 0) {
@@ -6205,11 +6196,8 @@ int main (int argc, char **argv) {
 
     /* Signal attaching processes that full initialisation is complete */
     if (g_shm_backend && settings.shm_create) {
-        mc_shm_backend_t *b = (mc_shm_backend_t *)g_shm_backend;
-        b->ctrl->initialized = 1;
+        ((mc_shm_backend_t *)g_shm_backend)->ctrl->initialized = 1;
         fprintf(stderr, "shm: signalled ready (ctrl->initialized=1)\n");
-        shm_debug_mutex_words("slabs_lock at ready", &b->ctrl->slabs_lock);
-        shm_debug_mutex_trylock("slabs_lock at ready", &b->ctrl->slabs_lock);
     }
 
     if (settings.idle_timeout && start_conn_timeout_thread() == -1) {

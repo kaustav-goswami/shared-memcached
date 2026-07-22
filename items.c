@@ -1,6 +1,7 @@
 /* -*- Mode: C; tab-width: 4; c-basic-offset: 4; indent-tabs-mode: nil -*- */
 #include "memcached.h"
 #include "shm_backend.h"
+#include "shm_sync.h"
 #include "bipbuffer.h"
 #include "storage.h"
 #include "slabs_mover.h"
@@ -107,7 +108,7 @@ void items_shm_setup(mc_shm_backend_t *b)
 #undef cas_id_lock
 
     g_cas_id_p    = &ctrl->cas_id;
-    cas_id_lock_p = &ctrl->cas_id_lock;
+    /* cas_id_lock stays private; shm_sync no-ops on the local mutex. */
 
 #pragma pop_macro("cas_id_lock")
 #pragma pop_macro("cas_id")
@@ -116,9 +117,9 @@ void items_shm_setup(mc_shm_backend_t *b)
 void item_stats_reset(void) {
     int i;
     for (i = 0; i < LARGEST_ID; i++) {
-        pthread_mutex_lock(&lru_locks[i]);
+        shm_sync_lock(&lru_locks[i]);
         memset(&itemstats[i], 0, sizeof(itemstats_t));
-        pthread_mutex_unlock(&lru_locks[i]);
+        shm_sync_unlock(&lru_locks[i]);
     }
 }
 
@@ -155,6 +156,8 @@ static uint64_t lru_total_bumps_dropped(void);
 /* Get the next CAS id for a new item. */
 /* TODO: refactor some atomics for this. */
 uint64_t get_cas_id(void) {
+    if (g_shm_backend)
+        return ++cas_id;
     pthread_mutex_lock(&cas_id_lock);
     uint64_t next_id = ++cas_id;
     pthread_mutex_unlock(&cas_id_lock);
@@ -162,6 +165,10 @@ uint64_t get_cas_id(void) {
 }
 
 void set_cas_id(uint64_t new_cas) {
+    if (g_shm_backend) {
+        cas_id = new_cas;
+        return;
+    }
     pthread_mutex_lock(&cas_id_lock);
     cas_id = new_cas;
     pthread_mutex_unlock(&cas_id_lock);
@@ -245,9 +252,9 @@ item *do_item_alloc_pull(const size_t ntotal, const unsigned int id) {
     }
 
     if (i > 0) {
-        pthread_mutex_lock(&lru_locks[id]);
+        shm_sync_lock(&lru_locks[id]);
         itemstats[id].direct_reclaims += i;
-        pthread_mutex_unlock(&lru_locks[id]);
+        shm_sync_unlock(&lru_locks[id]);
     }
 
     return it;
@@ -347,9 +354,9 @@ item *do_item_alloc(const char *key, const size_t nkey, const client_flags_t fla
     }
 
     if (it == NULL) {
-        pthread_mutex_lock(&lru_locks[id]);
+        shm_sync_lock(&lru_locks[id]);
         itemstats[id].outofmemory++;
-        pthread_mutex_unlock(&lru_locks[id]);
+        shm_sync_unlock(&lru_locks[id]);
         return NULL;
     }
 
@@ -485,16 +492,16 @@ static void do_item_link_q(item *it) { /* item is the new head */
 }
 
 static void item_link_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    shm_sync_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    shm_sync_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 static void item_link_q_warm(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    shm_sync_lock(&lru_locks[it->slabs_clsid]);
     do_item_link_q(it);
     itemstats[it->slabs_clsid].moves_to_warm++;
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    shm_sync_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 static void do_item_unlink_q(item *it) {
@@ -530,9 +537,9 @@ static void do_item_unlink_q(item *it) {
 }
 
 static void item_unlink_q(item *it) {
-    pthread_mutex_lock(&lru_locks[it->slabs_clsid]);
+    shm_sync_lock(&lru_locks[it->slabs_clsid]);
     do_item_unlink_q(it);
-    pthread_mutex_unlock(&lru_locks[it->slabs_clsid]);
+    shm_sync_unlock(&lru_locks[it->slabs_clsid]);
 }
 
 int do_item_link(item *it, const uint32_t hv, const uint64_t cas) {
@@ -648,7 +655,7 @@ void item_flush_expired(void) {
          * back until we hit an item older than the oldest_live time.
          * The oldest_live checking will auto-expire the remaining items.
          */
-        pthread_mutex_lock(&lru_locks[i]);
+        shm_sync_lock(&lru_locks[i]);
         for (iter = heads[i]; iter != NULL; iter = next) {
             void *hold_lock = NULL;
             next = iter->next;
@@ -678,7 +685,7 @@ void item_flush_expired(void) {
                 break;
             }
         }
-        pthread_mutex_unlock(&lru_locks[i]);
+        shm_sync_unlock(&lru_locks[i]);
     }
 }
 
@@ -701,12 +708,12 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     unsigned int id = slabs_clsid;
     id |= COLD_LRU;
 
-    pthread_mutex_lock(&lru_locks[id]);
+    shm_sync_lock(&lru_locks[id]);
     it = heads[id];
 
     buffer = malloc((size_t)memlimit);
     if (buffer == 0) {
-        pthread_mutex_unlock(&lru_locks[id]);
+        shm_sync_unlock(&lru_locks[id]);
         return NULL;
     }
     bufcurr = 0;
@@ -737,7 +744,7 @@ char *item_cachedump(const unsigned int slabs_clsid, const unsigned int limit, u
     bufcurr += 5;
 
     *bytes = bufcurr;
-    pthread_mutex_unlock(&lru_locks[id]);
+    shm_sync_unlock(&lru_locks[id]);
     return buffer;
 }
 
@@ -751,13 +758,13 @@ void fill_item_stats_automove(item_stats_automove *am) {
 
         // outofmemory records into HOT
         int i = n | HOT_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        shm_sync_lock(&lru_locks[i]);
         cur->outofmemory = itemstats[i].outofmemory;
-        pthread_mutex_unlock(&lru_locks[i]);
+        shm_sync_unlock(&lru_locks[i]);
 
         // evictions and tail age are from COLD
         i = n | COLD_LRU;
-        pthread_mutex_lock(&lru_locks[i]);
+        shm_sync_lock(&lru_locks[i]);
         cur->evicted = itemstats[i].evicted;
         if (!tails[i]) {
             cur->age = 0;
@@ -771,7 +778,7 @@ void fill_item_stats_automove(item_stats_automove *am) {
         } else {
             cur->age = current_time - tails[i]->time;
         }
-        pthread_mutex_unlock(&lru_locks[i]);
+        shm_sync_unlock(&lru_locks[i]);
      }
 }
 
@@ -779,19 +786,12 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
     itemstats_t totals;
     memset(&totals, 0, sizeof(itemstats_t));
     int n;
-    bool lock_lru = (g_shm_backend == NULL);
-
     for (n = 0; n < MAX_NUMBER_OF_SLAB_CLASSES; n++) {
         int x;
         int i;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            if (lock_lru) {
-                pthread_mutex_lock(&lru_locks[i]);
-            } else if (g_shm_backend && settings.verbose > 1 && n == 0 && x == 0) {
-                shm_debug_trace("item_stats_totals: shm workaround (skip lru_locks)",
-                                NULL);
-            }
+            shm_sync_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.reclaimed += itemstats[i].reclaimed;
             totals.expired_unfetched += itemstats[i].expired_unfetched;
@@ -804,8 +804,7 @@ void item_stats_totals(ADD_STAT add_stats, void *c) {
             totals.moves_to_warm += itemstats[i].moves_to_warm;
             totals.moves_within_lru += itemstats[i].moves_within_lru;
             totals.direct_reclaims += itemstats[i].direct_reclaims;
-            if (lock_lru)
-                pthread_mutex_unlock(&lru_locks[i]);
+            shm_sync_unlock(&lru_locks[i]);
         }
     }
     APPEND_STAT("expired_unfetched", "%llu",
@@ -860,7 +859,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
         int klen = 0, vlen = 0;
         for (x = 0; x < 4; x++) {
             i = n | lru_type_map[x];
-            pthread_mutex_lock(&lru_locks[i]);
+            shm_sync_lock(&lru_locks[i]);
             totals.evicted += itemstats[i].evicted;
             totals.evicted_nonzero += itemstats[i].evicted_nonzero;
             totals.reclaimed += itemstats[i].reclaimed;
@@ -902,7 +901,7 @@ void item_stats(ADD_STAT add_stats, void *c) {
                     totals.hits_to_temp = thread_stats.lru_hits[i];
                     break;
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            shm_sync_unlock(&lru_locks[i]);
         }
         if (size == 0)
             continue;
@@ -1155,7 +1154,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
     uint64_t limit = 0;
 
     id |= cur_lru;
-    pthread_mutex_lock(&lru_locks[id]);
+    shm_sync_lock(&lru_locks[id]);
     search = tails[id];
     /* We walk up *only* for locked items, and if bottom is expired. */
     for (; tries > 0 && search != NULL; tries--, search=next_it) {
@@ -1164,7 +1163,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
         if (search->nbytes == 0 && search->nkey == 0 && search->it_flags == 1) {
             /* We are a crawler, ignore it. */
             if (flags & LRU_PULL_CRAWL_BLOCKS) {
-                pthread_mutex_unlock(&lru_locks[id]);
+                shm_sync_unlock(&lru_locks[id]);
                 return 0;
             }
             tries++;
@@ -1297,7 +1296,7 @@ int lru_pull_tail(const int orig_id, const int cur_lru,
             break;
     }
 
-    pthread_mutex_unlock(&lru_locks[id]);
+    shm_sync_unlock(&lru_locks[id]);
 
     if (it != NULL) {
         if (move_to_lru) {
@@ -1457,25 +1456,25 @@ static int lru_maintainer_juggle(const int slabs_clsid) {
     rel_time_t warm_age = 0;
     /* If LRU is in flat mode, force items to drain into COLD via max age of 0 */
     if (settings.lru_segmented) {
-        pthread_mutex_lock(&lru_locks[slabs_clsid|COLD_LRU]);
+        shm_sync_lock(&lru_locks[slabs_clsid|COLD_LRU]);
         if (tails[slabs_clsid|COLD_LRU]) {
             cold_age = current_time - tails[slabs_clsid|COLD_LRU]->time;
         }
         // Also build up total_bytes for the classes.
         total_bytes += sizes_bytes[slabs_clsid|COLD_LRU];
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
+        shm_sync_unlock(&lru_locks[slabs_clsid|COLD_LRU]);
 
         hot_age = cold_age * settings.hot_max_factor;
         warm_age = cold_age * settings.warm_max_factor;
 
         // total_bytes doesn't have to be exact. cache it for the juggles.
-        pthread_mutex_lock(&lru_locks[slabs_clsid|HOT_LRU]);
+        shm_sync_lock(&lru_locks[slabs_clsid|HOT_LRU]);
         total_bytes += sizes_bytes[slabs_clsid|HOT_LRU];
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|HOT_LRU]);
+        shm_sync_unlock(&lru_locks[slabs_clsid|HOT_LRU]);
 
-        pthread_mutex_lock(&lru_locks[slabs_clsid|WARM_LRU]);
+        shm_sync_lock(&lru_locks[slabs_clsid|WARM_LRU]);
         total_bytes += sizes_bytes[slabs_clsid|WARM_LRU];
-        pthread_mutex_unlock(&lru_locks[slabs_clsid|WARM_LRU]);
+        shm_sync_unlock(&lru_locks[slabs_clsid|WARM_LRU]);
     }
 
     /* Juggle HOT/WARM up to N times */
@@ -1585,11 +1584,11 @@ static void lru_maintainer_crawler_check(struct crawler_expired_data *cdata, log
             pthread_mutex_unlock(&cdata->lock);
         }
         if (current_time > next_crawls[i]) {
-            pthread_mutex_lock(&lru_locks[i]);
+            shm_sync_lock(&lru_locks[i]);
             if (sizes[i] > tocrawl_limit) {
                 tocrawl_limit = sizes[i];
             }
-            pthread_mutex_unlock(&lru_locks[i]);
+            shm_sync_unlock(&lru_locks[i]);
             todo[i] = 1;
             do_run = true;
             next_crawls[i] = current_time + 5; // minimum retry wait.

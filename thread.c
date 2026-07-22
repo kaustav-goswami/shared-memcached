@@ -3,6 +3,7 @@
  * Thread management for memcached.
  */
 #include "memcached.h"
+#include "shm_sync.h"
 #include "shm_backend.h"
 #ifdef EXTSTORE
 #include "storage.h"
@@ -120,10 +121,14 @@ static void thread_libevent_ionotify(evutil_socket_t fd, short which, void *arg)
  */
 
 void item_lock(uint32_t hv) {
+    if (g_shm_backend)
+        return;
     mutex_lock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
 void *item_trylock(uint32_t hv) {
+    if (g_shm_backend)
+        return (void *)(uintptr_t)1;
     pthread_mutex_t *lock = &item_locks[hv & hashmask(item_lock_hashpower)];
     if (pthread_mutex_trylock(lock) == 0) {
         return lock;
@@ -132,10 +137,14 @@ void *item_trylock(uint32_t hv) {
 }
 
 void item_trylock_unlock(void *lock) {
+    if (g_shm_backend)
+        return;
     mutex_unlock((pthread_mutex_t *) lock);
 }
 
 void item_unlock(uint32_t hv) {
+    if (g_shm_backend)
+        return;
     mutex_unlock(&item_locks[hv & hashmask(item_lock_hashpower)]);
 }
 
@@ -1089,18 +1098,11 @@ void memcached_thread_init(int nthreads, void *arg) {
     int         power;
 
     if (g_shm_backend) {
-        /*
-         * Shared-memory mode: use the process-shared locks from the control
-         * block.  The creator already initialised them with
-         * PTHREAD_PROCESS_SHARED in shm_backend_create(); attaching processes
-         * just point at the same memory.
-         */
         shm_control_block_t *ctrl = g_shm_backend->ctrl;
 
-        lru_locks           = ctrl->lru_locks;
-        item_locks          = ctrl->item_locks;
         item_lock_count     = ctrl->item_lock_count;
         item_lock_hashpower = ctrl->item_lock_hashpower;
+        item_locks          = NULL; /* unused: item_lock() is a no-op in SHM mode */
 
         pthread_mutex_init(&worker_hang_lock, NULL);
         pthread_mutex_init(&init_lock, NULL);

@@ -5,7 +5,6 @@
 
 #include "memcached.h"
 #include "proto_text.h"
-#include "shm_backend.h"
 // FIXME: only for process_proxy_stats()
 // - some better/different structure for stats subcommands
 // would remove this abstraction leak.
@@ -750,14 +749,8 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
     }
 
     if (ntokens == 2) {
-        if (g_shm_backend && settings.verbose > 1)
-            shm_debug_trace("stats: begin server_stats", NULL);
         server_stats(&append_stats, c);
-        if (g_shm_backend && settings.verbose > 1)
-            shm_debug_trace("stats: begin get_stats", NULL);
         (void)get_stats(NULL, 0, &append_stats, c);
-        if (g_shm_backend && settings.verbose > 1)
-            shm_debug_trace("stats: get_stats done", NULL);
     } else if (strcmp(subcommand, "reset") == 0) {
         stats_reset();
         out_string(c, "RESET");

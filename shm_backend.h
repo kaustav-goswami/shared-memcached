@@ -22,7 +22,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <pthread.h>
 
 #include "allocator/include/shm_alloc.h"
 #include "slabs_types.h"   /* slabclass_t, SLABS_SHM_MAX_LIST */
@@ -90,11 +89,7 @@ typedef struct {
     /* Storage backing each slabclass[i].slab_list pointer (pre-allocated) */
     void             *sc_slab_list[SHM_MAX_SLAB_CLASSES][SLABS_SHM_MAX_LIST];
 
-    /* ── Process-shared locks (placed last; large arrays) ───────────── */
-    pthread_mutex_t   slabs_lock;
-    pthread_mutex_t   cas_id_lock;
-    pthread_mutex_t   item_locks[SHM_ITEM_LOCK_COUNT];
-    pthread_mutex_t   lru_locks[SHM_POWER_LARGEST];
+    /* No pthread mutexes in the control block: gem5/DAX uses plain LD/ST only. */
 } shm_control_block_t;
 
 /* ── Per-process backend handle ─────────────────────────────────────────── */
@@ -160,14 +155,5 @@ int shm_backend_attach(const char       *name,
  * @param unlink If true, shm_unlink() the POSIX shm name (only creator should).
  */
 void shm_backend_destroy(mc_shm_backend_t *b, bool unlink);
-
-/** Log a shared-memory access step (no-op when addr is NULL). */
-void shm_debug_trace(const char *step, const void *addr);
-
-/** Dump the raw words of a pthread_mutex_t (for pshared init debugging). */
-void shm_debug_mutex_words(const char *label, const pthread_mutex_t *m);
-
-/** Log pthread_mutex_trylock result without leaving the mutex held. */
-void shm_debug_mutex_trylock(const char *label, pthread_mutex_t *m);
 
 #endif /* SHM_BACKEND_H */
